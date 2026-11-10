@@ -130,7 +130,7 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
             d["first"] = e["ts"] if d["first"] is None else min(d["first"], e["ts"])
             d["last"] = e["ts"] if d["last"] is None else max(d["last"], e["ts"])
 
-    alerts, watches = [], []
+    results = []
     for ip, d in agg.items():
         # P3 과속: window 초 안 최대 요청 수
         burst = _max_in_window(sorted(d["times"]), window)
@@ -152,16 +152,17 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
 
         if not reasons:
             continue
-        span = ""
-        if d["first"] and d["last"]:
-            span = f" ({d['first']:%m-%d %H:%M}~{d['last']:%H:%M})"
-        line = (f"IP {ip} — 점수 {score} · 서로 다른 경로 {len(d['paths'])}개{span}"
-                f"\n       {' · '.join(reasons)}")
-        (alerts if score >= score_threshold else watches).append((score, line))
+        # '자료'만 담는다 — 화면/파일 '보여주기'는 바깥에서(fmt_screen/fmt_file)
+        results.append({
+            "ip": ip, "score": score,
+            "level": "alert" if score >= score_threshold else "watch",
+            "distinct_paths": len(d["paths"]), "nf": d["nf"], "auth": d["auth"],
+            "probes": d["probes"], "tool": d["tool"], "rate": burst,
+            "first": d["first"], "last": d["last"], "reasons": reasons,
+        })
 
-    alerts.sort(reverse=True)
-    watches.sort(reverse=True)
-    return alerts, watches
+    results.sort(key=lambda r: -r["score"])
+    return results
 
 
 def _max_in_window(times, window):
@@ -187,6 +188,7 @@ def main():
     p.add_argument("--auth-threshold", type=int, default=5)
     p.add_argument("--rate-threshold", type=int, default=20)
     p.add_argument("--score-threshold", type=int, default=6)
+    p.add_argument("--alert-log", default=None, help="경보를 이어 적을 파일(간이 기록함)")
     a = p.parse_args()
 
     events, bad = [], 0
@@ -198,18 +200,46 @@ def main():
             elif line.strip():
                 bad += 1
 
-    alerts, watches = analyze(events, a.window, a.probe_threshold,
-                              a.auth_threshold, a.rate_threshold, a.score_threshold)
+    results = analyze(events, a.window, a.probe_threshold,
+                      a.auth_threshold, a.rate_threshold, a.score_threshold)
+    alerts = [r for r in results if r["level"] == "alert"]
+    watches = [r for r in results if r["level"] == "watch"]
 
     print(f"LogSentry — 로그 {len(events)}줄 분석"
           + (f" (형식 불일치 {bad}줄 건너뜀)" if bad else "") + "\n")
     print("🔴 경보" if alerts else "🔴 경보 없음")
-    for _, x in alerts:
-        print("  " + x)
+    for r in alerts:
+        print("  " + fmt_screen(r))
     print()
     print("🟡 관찰" if watches else "🟡 관찰 없음")
-    for _, x in watches:
-        print("  " + x)
+    for r in watches:
+        print("  " + fmt_screen(r))
+
+    # 경보를 파일에 이어 적는다 — 기계가 읽기 쉬운 ASCII key=value(어떤 도구·인코딩에서도 안 깨짐)
+    if a.alert_log and results:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(a.alert_log, "a", encoding="utf-8") as f:
+            for r in results:
+                tag = "ALERT" if r["level"] == "alert" else "WATCH"
+                f.write(f"[{stamp}] {tag} {fmt_file(r)}\n")
+        print(f"\n📝 경보 {len(alerts)}건·관찰 {len(watches)}건을 {a.alert_log} 에 기록")
+
+
+def fmt_screen(r):
+    """화면용(한글) — 사람이 읽기 좋게."""
+    span = f" ({r['first']:%m-%d %H:%M}~{r['last']:%H:%M})" if r["first"] and r["last"] else ""
+    return (f"IP {r['ip']} — 점수 {r['score']} · 서로 다른 경로 {r['distinct_paths']}개{span}"
+            f"\n       {' · '.join(r['reasons'])}")
+
+
+def fmt_file(r):
+    """파일 기록용(ASCII key=value) — 어떤 도구·인코딩에서도 안 깨지고 기계가 파싱 가능."""
+    span = ""
+    if r["first"] and r["last"]:
+        span = f" first={r['first']:%Y-%m-%dT%H:%M} last={r['last']:%H:%M}"
+    return (f"ip={r['ip']} score={r['score']} distinct_paths={r['distinct_paths']} "
+            f"notfound={r['nf']} authfail={r['auth']} probe_paths={r['probes']} "
+            f"tool_ua={int(r['tool'])} rate={r['rate']}{span}")
 
 
 if __name__ == "__main__":
