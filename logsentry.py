@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from collections import defaultdict, deque
 from datetime import datetime
 
@@ -179,27 +180,78 @@ def _max_in_window(times, window):
     return worst
 
 
+def load_events(path, fmt):
+    """로그 파일을 읽어 이벤트 목록으로. (못 읽은 줄 수도 함께)"""
+    events, bad = [], 0
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            e = parse_line(line, fmt)
+            if e:
+                events.append(e)
+            elif line.strip():
+                bad += 1
+    return events, bad
+
+
+def write_alert_log(path, results):
+    """경보를 ASCII key=value 로 파일에 이어 적는다."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(path, "a", encoding="utf-8") as f:
+        for r in results:
+            tag = "ALERT" if r["level"] == "alert" else "WATCH"
+            f.write(f"[{stamp}] {tag} {fmt_file(r)}\n")
+
+
+def run_watch(a):
+    """[v1] N초마다 로그를 다시 읽어 '새로 생기거나 바뀐 경보만' 알린다."""
+    print(f"자동 감시 시작 — {a.watch}초마다 {a.logfile} 재검사 (Ctrl+C 로 중지)")
+    seen = None
+    try:
+        while True:
+            events, _ = load_events(a.logfile, a.format)
+            results = analyze(events, a.window, a.probe_threshold,
+                              a.auth_threshold, a.rate_threshold, a.score_threshold)
+            current = {fmt_file(r): r for r in results}  # ASCII 줄을 '열쇠'로
+            stamp = datetime.now().strftime("%H:%M:%S")
+            if seen is None:                      # 첫 바퀴 = 기준선(조용)
+                seen = set(current)
+                print(f"[{stamp}] 기준선 — 현재 경보 {len(current)}건 저장")
+            else:
+                fresh = [current[k] for k in current if k not in seen]
+                if fresh:
+                    print(f"[{stamp}] 🔔 새 경보 {len(fresh)}건")
+                    for r in fresh:
+                        icon = "🔴" if r["level"] == "alert" else "🟡"
+                        print("  " + icon + " " + fmt_screen(r))
+                    if a.alert_log:
+                        write_alert_log(a.alert_log, fresh)
+                else:
+                    print(f"[{stamp}] 새 경보 없음")
+                seen |= set(current)
+            time.sleep(a.watch)
+    except KeyboardInterrupt:
+        print("\n감시 중지.")
+
+
 def main():
     p = argparse.ArgumentParser(description="LogSentry — 접근 로그 침입 탐지")
-    p.add_argument("logfile", help="접근 로그 파일(nginx/apache combined)")
-    p.add_argument("--format", default="nginx")
+    p.add_argument("logfile", help="접근 로그 파일(nginx/apache/JSON)")
+    p.add_argument("--format", default="auto")
     p.add_argument("--window", type=int, default=60)
     p.add_argument("--probe-threshold", type=int, default=5)
     p.add_argument("--auth-threshold", type=int, default=5)
     p.add_argument("--rate-threshold", type=int, default=20)
     p.add_argument("--score-threshold", type=int, default=6)
     p.add_argument("--alert-log", default=None, help="경보를 이어 적을 파일(간이 기록함)")
+    p.add_argument("--watch", type=int, metavar="SECONDS",
+                   help="N초마다 자동 재검사(새 경보만)")
     a = p.parse_args()
 
-    events, bad = [], 0
-    with open(a.logfile, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            e = parse_line(line, a.format)
-            if e:
-                events.append(e)
-            elif line.strip():
-                bad += 1
+    if a.watch:                 # 자동 감시 모드
+        run_watch(a)
+        return
 
+    events, bad = load_events(a.logfile, a.format)   # 한 번만 검사
     results = analyze(events, a.window, a.probe_threshold,
                       a.auth_threshold, a.rate_threshold, a.score_threshold)
     alerts = [r for r in results if r["level"] == "alert"]
@@ -215,13 +267,8 @@ def main():
     for r in watches:
         print("  " + fmt_screen(r))
 
-    # 경보를 파일에 이어 적는다 — 기계가 읽기 쉬운 ASCII key=value(어떤 도구·인코딩에서도 안 깨짐)
     if a.alert_log and results:
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(a.alert_log, "a", encoding="utf-8") as f:
-            for r in results:
-                tag = "ALERT" if r["level"] == "alert" else "WATCH"
-                f.write(f"[{stamp}] {tag} {fmt_file(r)}\n")
+        write_alert_log(a.alert_log, results)
         print(f"\n📝 경보 {len(alerts)}건·관찰 {len(watches)}건을 {a.alert_log} 에 기록")
 
 
