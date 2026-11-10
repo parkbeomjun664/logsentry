@@ -1,0 +1,14 @@
+{"remote_addr":"203.0.113.10","time":"2026-11-10T09:00:01+09:00","method":"GET","uri":"/","status":200,"user_agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0"}
+{"remote_addr":"203.0.113.10","time":"2026-11-10T09:00:04+09:00","method":"GET","uri":"/products","status":200,"user_agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0"}
+{"remote_addr":"45.146.0.99","time":"2026-11-10T09:01:01+09:00","method":"GET","uri":"/.env","status":404,"user_agent":"python-requests/2.31"}
+{"remote_addr":"45.146.0.99","time":"2026-11-10T09:01:01+09:00","method":"GET","uri":"/.git/config","status":404,"user_agent":"python-requests/2.31"}
+{"remote_addr":"45.146.0.99","time":"2026-11-10T09:01:02+09:00","method":"GET","uri":"/wp-login.php","status":404,"user_agent":"python-requests/2.31"}
+{"remote_addr":"45.146.0.99","time":"2026-11-10T09:01:02+09:00","method":"GET","uri":"/admin","status":404,"user_agent":"python-requests/2.31"}
+{"remote_addr":"45.146.0.99","time":"2026-11-10T09:01:03+09:00","method":"GET","uri":"/phpmyadmin","status":404,"user_agent":"python-requests/2.31"}
+{"remote_addr":"45.146.0.99","time":"2026-11-10T09:01:03+09:00","method":"GET","uri":"/actuator/env","status":404,"user_agent":"python-requests/2.31"}
+{"remote_addr":"45.146.0.99","time":"2026-11-10T09:01:04+09:00","method":"GET","uri":"/.aws/credentials","status":404,"user_agent":"python-requests/2.31"}
+{"remote_addr":"185.220.101.5","time":"2026-11-10T09:03:10+09:00","method":"POST","uri":"/api/login","status":401,"user_agent":"curl/8.4.0"}
+{"remote_addr":"185.220.101.5","time":"2026-11-10T09:03:12+09:00","method":"POST","uri":"/api/login","status":401,"user_agent":"curl/8.4.0"}
+{"remote_addr":"185.220.101.5","time":"2026-11-10T09:03:14+09:00","method":"POST","uri":"/api/login","status":401,"user_agent":"curl/8.4.0"}
+{"remote_addr":"185.220.101.5","time":"2026-11-10T09:03:16+09:00","method":"POST","uri":"/api/login","status":403,"user_agent":"curl/8.4.0"}
+{"remote_addr":"198.51.100.22","time":"2026-11-10T09:10:00+09:00","method":"GET","uri":"/orders","status":200,"user_agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Safari/604.1"}

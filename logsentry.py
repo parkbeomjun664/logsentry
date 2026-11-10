@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from collections import defaultdict, deque
 from datetime import datetime
@@ -42,7 +43,17 @@ _PROBE_PATHS = ("/.env", "/.git", "/wp-login", "/wp-admin", "/phpmyadmin",
 _SKIP = ("/favicon.ico", "/robots.txt", "/health")
 
 
-def parse_line(line, fmt="nginx"):
+def parse_line(line, fmt="auto"):
+    """로그 한 줄 → 공통 형태 dict. 양식을 자동 감지한다(입구만 양식을 탄다)."""
+    line = line.strip()
+    if not line:
+        return None
+    if line.startswith("{"):      # JSON 로그
+        return _parse_json(line)
+    return _parse_nginx(line)     # nginx/apache combined
+
+
+def _parse_nginx(line):
     m = _NGINX.match(line)
     if not m:
         return None
@@ -57,6 +68,32 @@ def parse_line(line, fmt="nginx"):
         "path": m.group("path").split("?")[0],  # 쿼리스트링 제거
         "status": int(m.group("status")),
         "ua": m.group("ua"),
+    }
+
+
+def _parse_json(line):
+    try:
+        o = json.loads(line)
+    except ValueError:
+        return None
+    # 흔한 필드 이름들을 두루 받아 준다
+    ip = o.get("remote_addr") or o.get("ip") or o.get("client_ip")
+    status = o.get("status")
+    if not ip or status is None:
+        return None
+    path = o.get("uri") or o.get("path") or ""
+    tstr = o.get("time") or o.get("time_iso8601") or o.get("timestamp")
+    try:
+        ts = datetime.fromisoformat(tstr) if tstr else None
+    except ValueError:
+        ts = None
+    return {
+        "ip": ip,
+        "ts": ts,
+        "method": o.get("method") or "",
+        "path": str(path).split("?")[0],
+        "status": int(status),
+        "ua": o.get("user_agent") or o.get("http_user_agent") or "",
     }
 
 
