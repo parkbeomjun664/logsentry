@@ -34,10 +34,10 @@ _NGINX = re.compile(
 )
 _TIME_FMT = "%d/%b/%Y:%H:%M:%S %z"
 
-# 공격 도구 지문(User-Agent)
+# 공격 도구 지문(User-Agent) — 구체적인 도구 이름만.
+# ("bot","agent","scan" 같은 일반 조각은 Googlebot 등 정상 크롤러를 오탐해 뺐다)
 _TOOL_UA = ("curl", "python-requests", "python-urllib", "wget", "go-http",
-            "nikto", "sqlmap", "nmap", "masscan", "scan", "zgrab", "httpx",
-            "recon", "agent", "bot")
+            "nikto", "sqlmap", "nmap", "masscan", "zgrab", "httpx")
 # 흔한 탐침 경로(있으면 가중)
 _PROBE_PATHS = ("/.env", "/.git", "/wp-login", "/wp-admin", "/phpmyadmin",
                 "/admin", "/actuator", "/config", "/backup", "/.aws",
@@ -83,13 +83,15 @@ def load_config(path):
 
 
 def parse_line(line, fmt="auto"):
-    """로그 한 줄 → 공통 형태 dict. 양식을 자동 감지한다(입구만 양식을 탄다)."""
+    """로그 한 줄 → 공통 형태 dict. fmt 로 양식을 고르거나 auto 로 자동 감지(입구만 양식을 탄다)."""
     line = line.strip()
     if not line:
         return None
-    if line.startswith("{"):      # JSON 로그
-        return _parse_json(line)
-    return _parse_nginx(line)     # nginx/apache combined
+    if fmt == "json" or (fmt == "auto" and line.startswith("{")):
+        return _parse_json(line)       # JSON 로그
+    if fmt in ("nginx", "apache", "auto"):
+        return _parse_nginx(line)      # nginx/apache combined
+    return None
 
 
 def _parse_nginx(line):
@@ -299,7 +301,9 @@ def run_watch(a):
 def main():
     p = argparse.ArgumentParser(description="LogSentry — 접근 로그 침입 탐지")
     p.add_argument("logfile", help="접근 로그 파일(nginx/apache/JSON)")
-    p.add_argument("--format", default="auto")
+    p.add_argument("--format", default="auto",
+                   choices=["auto", "nginx", "apache", "json"],
+                   help="로그 형식(기본 auto=자동 감지)")
     p.add_argument("--window", type=int, default=None)
     p.add_argument("--probe-threshold", type=int, default=None)
     p.add_argument("--auth-threshold", type=int, default=None)
