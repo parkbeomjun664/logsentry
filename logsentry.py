@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
+import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime
 
@@ -42,6 +44,42 @@ _PROBE_PATHS = ("/.env", "/.git", "/wp-login", "/wp-admin", "/phpmyadmin",
                 "/server-status", "/.ssh", "/vendor", "/shell")
 # 정상 소음(제외)
 _SKIP = ("/favicon.ico", "/robots.txt", "/health")
+# 신뢰 IP(회사·사내 공유 IP 등) — 경보에서 제외해 오탐을 줄인다
+_TRUSTED_IPS = ()
+# 문턱 기본값 — logsentry.json 의 "thresholds" 로 덮어쓸 수 있다
+DEFAULT_THRESHOLDS = {"window": 60, "probe": 5, "auth": 5, "rate": 20, "score": 6}
+
+
+def load_config(path):
+    """설정 파일(logsentry.json)이 있으면 목록·신뢰IP 를 덮어쓰고 문턱을 돌려준다.
+
+    코드를 고치지 않고 회사마다 탐침 경로·도구 지문·신뢰 IP·문턱을 바꾸게 한다.
+    파일이 없거나 읽기 실패하면 조용히 기본값을 쓴다(도구가 멈추지 않게).
+    """
+    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS
+    thresholds = dict(DEFAULT_THRESHOLDS)
+    thresholds["webhook"] = ""   # 알림 웹훅 주소(선택) — 설정 파일로 덮어씀
+    if not path or not os.path.exists(path):
+        return thresholds
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ 설정 파일 {path} 를 못 읽어 기본값으로 진행합니다: {e}")
+        return thresholds
+    if "tool_ua" in cfg:
+        _TOOL_UA = tuple(cfg["tool_ua"])
+    if "probe_paths" in cfg:
+        _PROBE_PATHS = tuple(cfg["probe_paths"])
+    if "skip" in cfg:
+        _SKIP = tuple(cfg["skip"])
+    if "trusted_ips" in cfg:
+        _TRUSTED_IPS = tuple(cfg["trusted_ips"])
+    if "webhook" in cfg:
+        thresholds["webhook"] = cfg["webhook"]
+    thresholds.update(cfg.get("thresholds", {}))
+    print(f"⚙ 설정 파일 {path} 적용")
+    return thresholds
 
 
 def parse_line(line, fmt="auto"):
@@ -113,6 +151,8 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
         "tool": False, "first": None, "last": None, "times": [],
     })
     for e in events:
+        if e["ip"] in _TRUSTED_IPS:   # 신뢰 IP 는 경보 대상에서 제외(오탐 감소)
+            continue
         if any(e["path"].startswith(s) for s in _SKIP):
             continue
         d = agg[e["ip"]]
@@ -202,6 +242,28 @@ def write_alert_log(path, results):
             f.write(f"[{stamp}] {tag} {fmt_file(r)}\n")
 
 
+def send_webhook(url, results):
+    """[v1] 경보를 웹훅(JSON POST)으로 보낸다. 슬랙/디스코드/범용 HTTP 수신기 호환.
+
+    - 주소가 없거나 '경보' 등급이 없으면 아무것도 보내지 않는다.
+    - 전송에 실패해도 예외를 밖으로 던지지 않는다(감시가 멈추면 안 되므로).
+    """
+    alerts = [r for r in results if r["level"] == "alert"]
+    if not url or not alerts:
+        return
+    lines = [f"🔴 {r['ip']} 점수 {r['score']} — {' · '.join(r['reasons'])}" for r in alerts]
+    text = f"[LogSentry] 경보 {len(alerts)}건\n" + "\n".join(lines)
+    payload = json.dumps({"text": text}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "LogSentry"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except Exception as e:  # noqa: BLE001  — 알림 실패가 도구를 멈추게 두지 않는다
+        print(f"⚠ 웹훅 전송 실패(무시하고 계속): {e}")
+
+
 def run_watch(a):
     """[v1] N초마다 로그를 다시 읽어 '새로 생기거나 바뀐 경보만' 알린다."""
     print(f"자동 감시 시작 — {a.watch}초마다 {a.logfile} 재검사 (Ctrl+C 로 중지)")
@@ -225,6 +287,7 @@ def run_watch(a):
                         print("  " + icon + " " + fmt_screen(r))
                     if a.alert_log:
                         write_alert_log(a.alert_log, fresh)
+                    send_webhook(a.webhook, fresh)   # 새 경보만 알림(소음 방지)
                 else:
                     print(f"[{stamp}] 새 경보 없음")
                 seen |= set(current)
@@ -237,15 +300,34 @@ def main():
     p = argparse.ArgumentParser(description="LogSentry — 접근 로그 침입 탐지")
     p.add_argument("logfile", help="접근 로그 파일(nginx/apache/JSON)")
     p.add_argument("--format", default="auto")
-    p.add_argument("--window", type=int, default=60)
-    p.add_argument("--probe-threshold", type=int, default=5)
-    p.add_argument("--auth-threshold", type=int, default=5)
-    p.add_argument("--rate-threshold", type=int, default=20)
-    p.add_argument("--score-threshold", type=int, default=6)
+    p.add_argument("--window", type=int, default=None)
+    p.add_argument("--probe-threshold", type=int, default=None)
+    p.add_argument("--auth-threshold", type=int, default=None)
+    p.add_argument("--rate-threshold", type=int, default=None)
+    p.add_argument("--score-threshold", type=int, default=None)
     p.add_argument("--alert-log", default=None, help="경보를 이어 적을 파일(간이 기록함)")
+    p.add_argument("--webhook", default=None,
+                   help="경보를 보낼 웹훅 주소(슬랙/디스코드/범용 HTTP). 설정 파일로도 지정 가능")
+    p.add_argument("--config", default="logsentry.json",
+                   help="설정 파일(JSON) — 있으면 목록·문턱·신뢰IP·웹훅 을 덮어씀")
     p.add_argument("--watch", type=int, metavar="SECONDS",
                    help="N초마다 자동 재검사(새 경보만)")
     a = p.parse_args()
+
+    # 설정 파일을 읽어 목록·신뢰IP 를 덮어쓰고, 문턱은 명령줄 > 설정파일 > 기본값 순으로 정한다
+    th = load_config(a.config)
+    if a.window is None:
+        a.window = th["window"]
+    if a.probe_threshold is None:
+        a.probe_threshold = th["probe"]
+    if a.auth_threshold is None:
+        a.auth_threshold = th["auth"]
+    if a.rate_threshold is None:
+        a.rate_threshold = th["rate"]
+    if a.score_threshold is None:
+        a.score_threshold = th["score"]
+    if not a.webhook:           # 명령줄 > 설정파일 순으로 웹훅 주소를 정한다
+        a.webhook = th["webhook"]
 
     if a.watch:                 # 자동 감시 모드
         run_watch(a)
@@ -270,6 +352,10 @@ def main():
     if a.alert_log and results:
         write_alert_log(a.alert_log, results)
         print(f"\n📝 경보 {len(alerts)}건·관찰 {len(watches)}건을 {a.alert_log} 에 기록")
+
+    if a.webhook and alerts:
+        send_webhook(a.webhook, alerts)
+        print(f"📡 경보 {len(alerts)}건을 웹훅으로 전송")
 
 
 def fmt_screen(r):

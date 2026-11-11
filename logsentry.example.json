@@ -1,0 +1,15 @@
+{
+  "comment": "LogSentry 설정 견본. 이 파일을 logsentry.json 으로 복사해 회사 환경에 맞게 고쳐 쓰세요. logsentry.json 이 없으면 코드 기본값으로 동작합니다.",
+  "comment_trusted_ips": "회사·사내 공유 IP 등 경보에서 제외할 주소. 공유 IP 오탐을 줄인다.",
+  "trusted_ips": ["203.0.113.10"],
+  "comment_probe_paths": "'없으면 공격 의심'인 경로들. 예: /admin 이 진짜 관리자 페이지라면 이 목록에서 빼면 직원이 오탐으로 잡히지 않는다.",
+  "probe_paths": ["/.env", "/.git", "/wp-login.php", "/phpmyadmin", "/actuator", "/.aws", "/config.php", "/backup.sql"],
+  "comment_skip": "정상 소음(세지 않음).",
+  "skip": ["/favicon.ico", "/robots.txt", "/health"],
+  "comment_tool_ua": "공격 도구로 의심할 User-Agent 조각(소문자 부분일치).",
+  "tool_ua": ["curl", "python-requests", "sqlmap", "nmap", "nikto", "go-http-client", "wget"],
+  "comment_webhook": "새 경보를 보낼 웹훅 주소(슬랙/디스코드/범용 HTTP). 비우면 전송 안 함.",
+  "webhook": "",
+  "comment_thresholds": "경보 문턱. 민감하게 하려면 낮추고, 둔감하게 하려면 올린다.",
+  "thresholds": {"window": 60, "probe": 5, "auth": 5, "rate": 20, "score": 6}
+}

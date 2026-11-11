@@ -1,3 +1,5 @@
 alerts.txt
 __pycache__/
 *.pyc
+logsentry.json
+infolink_access.log
