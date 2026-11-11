@@ -89,6 +89,37 @@ class TestDetection(unittest.TestCase):
         r = run(lines)
         self.assertNotIn("203.0.113.10", r)
 
+    def test_7_stealthy_combined_is_alerted(self):
+        """저강도라도 서로 다른 신호가 겹치면(없는주소+인증실패) 종합점수로 경보.
+
+        개별 신호는 각 문턱(5) 미만이고 UA 도 브라우저로 위장 → 예전엔 조용히 통과했다.
+        INFOLINK 데모에서 발견한 약점(복합 의심).
+        """
+        lines = [nginx("185.220.101.50", f"09:10:0{i}", "GET", p, 404, BROWSER)
+                 for i, p in enumerate(["/legacy", "/old", "/v1x", "/arch"])]
+        lines += [nginx("185.220.101.50", f"09:10:1{i}", "POST", "/auth/login", 401, BROWSER)
+                  for i in range(4)]
+        r = run(lines)
+        self.assertIn("185.220.101.50", r)
+        self.assertEqual(r["185.220.101.50"]["level"], "alert")
+
+    def test_8_single_signal_failed_logins_not_alerted(self):
+        """정상 직원이 비번 몇 번 틀린 것(단일 종류 신호)은 복합 의심으로 오탐하지 않는다."""
+        lines = [nginx("203.0.113.88", f"09:20:0{i}", "POST", "/auth/login", 401, BROWSER)
+                 for i in range(3)]
+        r = run(lines)
+        self.assertNotIn("203.0.113.88", r)
+
+    def test_9_account_lockout_423_counts_as_auth(self):
+        """계정잠금(423)도 인증 실패로 세어, 무차별 로그인을 놓치지 않는다."""
+        lines = [nginx("198.51.100.7", f"09:30:0{i}", "POST", "/auth/login", 401, "curl/8.4.0")
+                 for i in range(4)]
+        lines += [nginx("198.51.100.7", f"09:30:1{i}", "POST", "/auth/login", 423, "curl/8.4.0")
+                  for i in range(2)]
+        r = run(lines)
+        self.assertEqual(r["198.51.100.7"]["level"], "alert")
+        self.assertEqual(r["198.51.100.7"]["auth"], 6)   # 401×4 + 423×2
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

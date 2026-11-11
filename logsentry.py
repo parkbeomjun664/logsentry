@@ -198,8 +198,17 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
         if d["tool"]:
             reasons.append("도구 UA")
 
+        # 개별 신호가 저마다 문턱을 못 넘어도, 서로 다른 종류의 의심 신호가 '겹치고'
+        # 종합 점수(P5)가 문턱을 넘으면 경보한다. 정상 사용자는 '없는 주소 뒤지기'와
+        # '로그인 실패'를 함께 하지 않는다 → 종류가 겹치는 것 자체가 공격 신호다.
+        # (단일 종류만으로 점수를 넘는 것은 제외 — 비번 몇 번 틀린 정상 직원 오탐 방지.)
         if not reasons:
-            continue
+            kinds = sum([d["nf"] > 0, d["auth"] > 0, d["probes"] > 0,
+                         d["tool"], burst >= rate_threshold])
+            if score >= score_threshold and kinds >= 2:
+                reasons.append(f"복합 의심(종합점수 {score}, 신호 {kinds}종)")
+            else:
+                continue
         # '자료'만 담는다 — 화면/파일 '보여주기'는 바깥에서(fmt_screen/fmt_file)
         results.append({
             "ip": ip, "score": score,
