@@ -44,6 +44,9 @@ _PROBE_PATHS = ("/.env", "/.git", "/wp-login", "/wp-admin", "/phpmyadmin",
                 "/server-status", "/.ssh", "/vendor", "/shell")
 # 정상 소음(제외)
 _SKIP = ("/favicon.ico", "/robots.txt", "/health")
+# 인증 실패로 볼 상태코드 — 401 비번틀림·403 권한없음·423 계정잠금(무차별의 결정적 증거).
+# 서버마다 로그인 실패를 400·422 등으로 주기도 해서 설정 파일로 넓힐 수 있다.
+_AUTH_STATUSES = (401, 403, 423)
 # 신뢰 IP(회사·사내 공유 IP 등) — 경보에서 제외해 오탐을 줄인다
 _TRUSTED_IPS = ()
 # 문턱 기본값 — logsentry.json 의 "thresholds" 로 덮어쓸 수 있다
@@ -56,7 +59,7 @@ def load_config(path):
     코드를 고치지 않고 회사마다 탐침 경로·도구 지문·신뢰 IP·문턱을 바꾸게 한다.
     파일이 없거나 읽기 실패하면 조용히 기본값을 쓴다(도구가 멈추지 않게).
     """
-    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS
+    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES
     thresholds = dict(DEFAULT_THRESHOLDS)
     thresholds["webhook"] = ""   # 알림 웹훅 주소(선택) — 설정 파일로 덮어씀
     if not path or not os.path.exists(path):
@@ -75,6 +78,8 @@ def load_config(path):
         _SKIP = tuple(cfg["skip"])
     if "trusted_ips" in cfg:
         _TRUSTED_IPS = tuple(cfg["trusted_ips"])
+    if "auth_statuses" in cfg:
+        _AUTH_STATUSES = tuple(cfg["auth_statuses"])
     if "webhook" in cfg:
         thresholds["webhook"] = cfg["webhook"]
     thresholds.update(cfg.get("thresholds", {}))
@@ -161,7 +166,7 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
         d["reqs"] += 1
         if e["status"] == 404:
             d["nf"] += 1
-        if e["status"] in (401, 403):
+        if e["status"] in _AUTH_STATUSES:
             d["auth"] += 1
         d["paths"].add(e["path"])
         if is_probe_path(e["path"]):

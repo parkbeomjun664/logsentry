@@ -6,6 +6,8 @@
   "probe_paths": ["/.env", "/.git", "/wp-login.php", "/phpmyadmin", "/actuator", "/.aws", "/config.php", "/backup.sql"],
   "comment_skip": "정상 소음(세지 않음).",
   "skip": ["/favicon.ico", "/robots.txt", "/health"],
+  "comment_auth_statuses": "인증 실패로 볼 상태코드. 401 비번틀림·403 권한없음·423 계정잠금. 서버가 로그인 실패를 400/422 로 주면 여기에 추가.",
+  "auth_statuses": [401, 403, 423],
   "comment_tool_ua": "공격 도구로 의심할 User-Agent 조각(소문자 부분일치).",
   "tool_ua": ["curl", "python-requests", "sqlmap", "nmap", "nikto", "go-http-client", "wget"],
   "comment_webhook": "새 경보를 보낼 웹훅 주소(슬랙/디스코드/범용 HTTP). 비우면 전송 안 함.",
