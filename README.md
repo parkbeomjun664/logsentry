@@ -38,6 +38,18 @@ python logsentry.py access.log
 python logsentry.py /var/log/nginx/access.log --watch 60 --alert-log alerts.txt
 ```
 
+## 테스트
+
+탐지 규칙이 깨지지 않았는지 자동으로 확인한다(표준 라이브러리 unittest, 의존성 0).
+
+```bash
+python -m unittest -v
+```
+
+스캐너·로그인 무차별·느린 분산 공격은 경보로 잡고, 정상 사용자·favicon 같은 소음은 잡지 않는지
+6가지 상황을 검사한다. 결과(경보 여부)뿐 아니라 셈(없는 주소 횟수 등)까지 확인해, 다른 점수에 가려
+고장이 조용히 지나가지 않게 했다.
+
 ## 탐지 규칙
 
 | 규칙 | 내용 |
