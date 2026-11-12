@@ -339,29 +339,37 @@ def run_watch(a):
     """[v1] N초마다 로그를 다시 읽어 '새로 생기거나 바뀐 경보만' 알린다."""
     print(f"자동 감시 시작 — {a.watch}초마다 {a.logfile} 재검사 (Ctrl+C 로 중지)")
     seen = None
+    seen_dist = set()           # 이미 알린 분산 신호 종류(분산 무차별/스캔)
     try:
         while True:
             events, _ = load_events(a.logfile, a.format)
             results = analyze(events, a.window, a.probe_threshold,
                               a.auth_threshold, a.rate_threshold, a.score_threshold)
             current = {alert_key(r): r for r in results}  # IP+등급을 '이름표'로
+            dist = detect_distributed(events, a.window, a.dist_threshold)  # [v2] 서버 전체
+            dist_now = {d["kind"] for d in dist}
             stamp = datetime.now().strftime("%H:%M:%S")
             if seen is None:                      # 첫 바퀴 = 기준선(조용)
                 seen = set(current)
-                print(f"[{stamp}] 기준선 — 현재 경보 {len(current)}건 저장")
+                seen_dist = set(dist_now)
+                print(f"[{stamp}] 기준선 — 현재 경보 {len(current)}건·분산 {len(dist_now)}건 저장")
             else:
                 fresh = [current[k] for k in current if k not in seen]
-                if fresh:
-                    print(f"[{stamp}] 🔔 새 경보 {len(fresh)}건")
+                fresh_dist = [d for d in dist if d["kind"] not in seen_dist]
+                if fresh or fresh_dist:
+                    print(f"[{stamp}] 🔔 새 경보 {len(fresh)}건·분산 {len(fresh_dist)}건")
                     for r in fresh:
                         icon = "🔴" if r["level"] == "alert" else "🟡"
                         print("  " + icon + " " + fmt_screen(r))
+                    for d in fresh_dist:
+                        print(f"  🌐 {d['kind']} — 서로 다른 IP {d['ips']}개 (한 {d['window']}초 창)")
                     if a.alert_log:
                         write_alert_log(a.alert_log, fresh)
                     send_webhook(a.webhook, fresh)   # 새 경보만 알림(소음 방지)
                 else:
                     print(f"[{stamp}] 새 경보 없음")
                 seen |= set(current)
+                seen_dist |= dist_now
             time.sleep(a.watch)
     except KeyboardInterrupt:
         print("\n감시 중지.")
