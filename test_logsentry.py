@@ -6,9 +6,13 @@
 실행:  python -m unittest -v
 """
 import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 
-from logsentry import analyze, parse_line
+import logsentry
+from logsentry import alert_key, analyze, load_config, parse_line, send_webhook
 
 # 기본 문턱(main 의 기본값과 같게)
 DEFAULTS = dict(window=60, probe_threshold=5, auth_threshold=5,
@@ -119,6 +123,73 @@ class TestDetection(unittest.TestCase):
         r = run(lines)
         self.assertEqual(r["198.51.100.7"]["level"], "alert")
         self.assertEqual(r["198.51.100.7"]["auth"], 6)   # 401×4 + 423×2
+
+
+class TestConfigAndAlerts(unittest.TestCase):
+    """설정 파일·웹훅·감시 이름표 — 손으로만 확인하던 것을 테스트로 고정."""
+
+    def setUp(self):
+        # load_config 가 바꾸는 전역을 백업(테스트 간 오염 방지)
+        self._backup = (logsentry._TOOL_UA, logsentry._PROBE_PATHS, logsentry._SKIP,
+                        logsentry._TRUSTED_IPS, logsentry._AUTH_STATUSES)
+
+    def tearDown(self):
+        (logsentry._TOOL_UA, logsentry._PROBE_PATHS, logsentry._SKIP,
+         logsentry._TRUSTED_IPS, logsentry._AUTH_STATUSES) = self._backup
+
+    def test_alert_key_groups_by_ip_and_level(self):
+        """감시 이름표는 IP+등급 — 같은 공격자는 한 이름표, 승격 시 다른 이름표."""
+        self.assertEqual(alert_key({"ip": "1.2.3.4", "level": "alert"}),
+                         alert_key({"ip": "1.2.3.4", "level": "alert"}))
+        self.assertNotEqual(alert_key({"ip": "1.2.3.4", "level": "watch"}),
+                            alert_key({"ip": "1.2.3.4", "level": "alert"}))
+
+    def test_load_config_overrides(self):
+        """설정 파일이 신뢰IP·인증코드·문턱을 덮어쓴다."""
+        cfg = {"trusted_ips": ["9.9.9.9"], "auth_statuses": [401, 403, 423, 422],
+               "thresholds": {"score": 99}}
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        try:
+            th = load_config(path)
+            self.assertEqual(th["score"], 99)
+            self.assertIn("9.9.9.9", logsentry._TRUSTED_IPS)
+            self.assertIn(422, logsentry._AUTH_STATUSES)
+        finally:
+            os.remove(path)
+
+    def test_load_config_missing_uses_defaults(self):
+        """설정 파일이 없으면 조용히 기본값."""
+        th = load_config("no_such_config_xyz.json")
+        self.assertEqual(th["window"], 60)
+        self.assertEqual(th["webhook"], "")
+
+    def test_trusted_ip_excluded_from_alerts(self):
+        """신뢰 IP 는 공격해도 경보에서 빠진다(오탐 방지)."""
+        lines = [nginx("9.9.9.9", f"09:40:0{i}", "GET", p, 404, "sqlmap/1.7")
+                 for i, p in enumerate(PROBES)]
+        # 설정으로 9.9.9.9 를 신뢰 IP 로
+        logsentry._TRUSTED_IPS = ("9.9.9.9",)
+        r = run(lines)
+        self.assertNotIn("9.9.9.9", r)
+
+    def test_send_webhook_noop_without_url_or_alert(self):
+        """주소가 없거나 경보가 없으면 전송을 시도조차 안 한다."""
+        with mock.patch("logsentry.urllib.request.urlopen") as m:
+            send_webhook("", [{"level": "alert", "ip": "1.1.1.1",
+                               "score": 9, "reasons": ["x"]}])
+            send_webhook("http://x.test/h", [{"level": "watch", "ip": "1.1.1.1",
+                                              "score": 3, "reasons": ["x"]}])
+            self.assertFalse(m.called)
+
+    def test_send_webhook_posts_alert(self):
+        """경보가 있고 주소가 있으면 실제로 POST 를 시도한다."""
+        r = {"level": "alert", "ip": "1.1.1.1", "score": 9,
+             "reasons": ["없는 주소 10회"]}
+        with mock.patch("logsentry.urllib.request.urlopen") as m:
+            send_webhook("http://x.test/hook", [r])
+            self.assertTrue(m.called)
 
 
 if __name__ == "__main__":

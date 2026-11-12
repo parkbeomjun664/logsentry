@@ -280,6 +280,16 @@ def send_webhook(url, results):
         print(f"⚠ 웹훅 전송 실패(무시하고 계속): {e}")
 
 
+def alert_key(r):
+    """자동 감시에서 '같은 경보'를 가릴 이름표 — IP와 등급만.
+
+    시각·점수까지 넣으면 같은 공격자가 조금만 더 움직여도 '새 경보'로 보여
+    매 바퀴 재알림이 터진다. IP+등급으로 묶어, 같은 공격자는 한 번만 알리고
+    관찰→경보로 '승격'될 때만 다시 알린다.
+    """
+    return f"{r['ip']}|{r['level']}"
+
+
 def run_watch(a):
     """[v1] N초마다 로그를 다시 읽어 '새로 생기거나 바뀐 경보만' 알린다."""
     print(f"자동 감시 시작 — {a.watch}초마다 {a.logfile} 재검사 (Ctrl+C 로 중지)")
@@ -289,7 +299,7 @@ def run_watch(a):
             events, _ = load_events(a.logfile, a.format)
             results = analyze(events, a.window, a.probe_threshold,
                               a.auth_threshold, a.rate_threshold, a.score_threshold)
-            current = {fmt_file(r): r for r in results}  # ASCII 줄을 '열쇠'로
+            current = {alert_key(r): r for r in results}  # IP+등급을 '이름표'로
             stamp = datetime.now().strftime("%H:%M:%S")
             if seen is None:                      # 첫 바퀴 = 기준선(조용)
                 seen = set(current)
