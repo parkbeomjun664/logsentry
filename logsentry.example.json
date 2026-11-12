@@ -12,6 +12,6 @@
   "tool_ua": ["curl", "python-requests", "sqlmap", "nmap", "nikto", "go-http-client", "wget"],
   "comment_webhook": "새 경보를 보낼 웹훅 주소(슬랙/디스코드/범용 HTTP). 비우면 전송 안 함.",
   "webhook": "",
-  "comment_thresholds": "경보 문턱. 민감하게 하려면 낮추고, 둔감하게 하려면 올린다.",
-  "thresholds": {"window": 60, "probe": 5, "auth": 5, "rate": 20, "score": 6}
+  "comment_thresholds": "경보 문턱. 민감하게 하려면 낮추고, 둔감하게 하려면 올린다. dist_ip=분산 경보용 한 시간창 안 서로 다른 IP 수.",
+  "thresholds": {"window": 60, "probe": 5, "auth": 5, "rate": 20, "score": 6, "dist_ip": 5}
 }

@@ -12,7 +12,8 @@ import unittest
 from unittest import mock
 
 import logsentry
-from logsentry import alert_key, analyze, load_config, parse_line, send_webhook
+from logsentry import (alert_key, analyze, detect_distributed, load_config,
+                       parse_line, send_webhook)
 
 # 기본 문턱(main 의 기본값과 같게)
 DEFAULTS = dict(window=60, probe_threshold=5, auth_threshold=5,
@@ -190,6 +191,40 @@ class TestConfigAndAlerts(unittest.TestCase):
         with mock.patch("logsentry.urllib.request.urlopen") as m:
             send_webhook("http://x.test/hook", [r])
             self.assertTrue(m.called)
+
+
+class TestDistributed(unittest.TestCase):
+    """[v2] 여러 IP 로 쪼갠 분산 공격 — 서버 전체 관점 탐지."""
+
+    def test_distributed_attack_detected(self):
+        """10개 IP가 짧은 창에 몰려 각자 조용히 공격해도 집단으로 잡는다."""
+        lines = []
+        for n in range(10):
+            lines.append(nginx(f"10.1.1.{n}", f"09:00:0{n}", "GET",
+                               f"/page-{n}", 404, BROWSER))
+            lines.append(nginx(f"10.1.1.{n}", f"09:00:0{n}", "POST",
+                               "/auth/login", 401, BROWSER))
+        events = [e for e in (parse_line(l) for l in lines) if e]
+        kinds = {d["kind"] for d in detect_distributed(events, 60, 5)}
+        self.assertIn("분산 무차별(인증실패)", kinds)
+        self.assertIn("분산 스캔(없는 주소)", kinds)
+        # 개별 IP 관점에선 아무도 경보가 아니어야(각 점수 3) — 그래서 분산 눈이 필요
+        r = run(lines)
+        self.assertEqual([x for x in r.values() if x["level"] == "alert"], [])
+
+    def test_distributed_spread_in_time_not_alerted(self):
+        """같은 IP 수라도 시간에 흩어져 있으면(창에 안 뭉치면) 분산 아님."""
+        lines = [nginx(f"10.2.2.{n}", f"09:{n:02d}:00", "POST",
+                       "/auth/login", 401, BROWSER) for n in range(10)]
+        events = [e for e in (parse_line(l) for l in lines) if e]
+        self.assertEqual(detect_distributed(events, 60, 5), [])
+
+    def test_distributed_few_ips_not_alerted(self):
+        """IP 수가 문턱 미만이면 분산 아님."""
+        lines = [nginx(f"3.3.3.{n}", f"09:00:0{n}", "POST",
+                       "/auth/login", 401, BROWSER) for n in range(3)]
+        events = [e for e in (parse_line(l) for l in lines) if e]
+        self.assertEqual(detect_distributed(events, 60, 5), [])
 
 
 if __name__ == "__main__":

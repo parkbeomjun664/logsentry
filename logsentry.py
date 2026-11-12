@@ -50,7 +50,8 @@ _AUTH_STATUSES = (401, 403, 423)
 # 신뢰 IP(회사·사내 공유 IP 등) — 경보에서 제외해 오탐을 줄인다
 _TRUSTED_IPS = ()
 # 문턱 기본값 — logsentry.json 의 "thresholds" 로 덮어쓸 수 있다
-DEFAULT_THRESHOLDS = {"window": 60, "probe": 5, "auth": 5, "rate": 20, "score": 6}
+DEFAULT_THRESHOLDS = {"window": 60, "probe": 5, "auth": 5, "rate": 20,
+                      "score": 6, "dist_ip": 5}
 
 
 def load_config(path):
@@ -236,6 +237,50 @@ def _max_in_window(times, window):
     return worst
 
 
+def _max_distinct_ips_in_window(timed_ips, window):
+    """(시각, IP) 목록에서 window 초 창 안의 '서로 다른 IP 최대 수'.
+
+    창을 미끄러뜨리며(슬라이딩) 각 순간 창 안 IP 종류 수를 세고 그 최댓값을 돌려준다.
+    Counter 로 창에 남은 IP 만 센다(같은 IP 가 여러 번이면 1로).
+    """
+    q = deque()
+    counts = defaultdict(int)   # 창 안에 살아있는 IP 별 등장 횟수
+    worst = 0
+    for ts, ip in sorted(timed_ips):      # 시각 순
+        q.append((ts, ip))
+        counts[ip] += 1
+        while (ts - q[0][0]).total_seconds() > window:   # 창 밖은 버린다
+            _, old = q.popleft()
+            counts[old] -= 1
+            if counts[old] == 0:
+                del counts[old]           # 창에서 완전히 빠진 IP 는 종류에서 제외
+        worst = max(worst, len(counts))   # 지금 창의 '서로 다른 IP 수'
+    return worst
+
+
+def detect_distributed(events, window, ip_threshold):
+    """[v2] 서버 전체 관점 — 짧은 시간창 안에 '같은 종류 공격을 낸 서로 다른 IP 수'.
+
+    IP 별 analyze 와 보는 축이 다르다: analyze='한 IP 가 몇 번?' / 여기='한 공격을 몇 IP 가?'.
+    여러 IP 로 잘게 쪼갠 분산 무차별·분산 스캔을, 한 IP 로는 조용해도 집단으로 잡는다.
+    신뢰 IP 는 제외하고, 404 는 정상 소음(_SKIP) 경로를 뺀다.
+    """
+    auth_hits = [(e["ts"], e["ip"]) for e in events
+                 if e["ts"] and e["ip"] not in _TRUSTED_IPS
+                 and e["status"] in _AUTH_STATUSES]
+    nf_hits = [(e["ts"], e["ip"]) for e in events
+               if e["ts"] and e["ip"] not in _TRUSTED_IPS and e["status"] == 404
+               and not any(e["path"].startswith(s) for s in _SKIP)]
+    results = []
+    auth_ips = _max_distinct_ips_in_window(auth_hits, window)
+    if auth_ips >= ip_threshold:
+        results.append({"kind": "분산 무차별(인증실패)", "ips": auth_ips, "window": window})
+    nf_ips = _max_distinct_ips_in_window(nf_hits, window)
+    if nf_ips >= ip_threshold:
+        results.append({"kind": "분산 스캔(없는 주소)", "ips": nf_ips, "window": window})
+    return results
+
+
 def load_events(path, fmt):
     """로그 파일을 읽어 이벤트 목록으로. (못 읽은 줄 수도 함께)"""
     events, bad = [], 0
@@ -333,6 +378,8 @@ def main():
     p.add_argument("--auth-threshold", type=int, default=None)
     p.add_argument("--rate-threshold", type=int, default=None)
     p.add_argument("--score-threshold", type=int, default=None)
+    p.add_argument("--dist-threshold", type=int, default=None,
+                   help="분산 경보 문턱 — 한 시간창(--window) 안 서로 다른 IP 수(기본 5)")
     p.add_argument("--alert-log", default=None, help="경보를 이어 적을 파일(간이 기록함)")
     p.add_argument("--webhook", default=None,
                    help="경보를 보낼 웹훅 주소(슬랙/디스코드/범용 HTTP). 설정 파일로도 지정 가능")
@@ -354,6 +401,8 @@ def main():
         a.rate_threshold = th["rate"]
     if a.score_threshold is None:
         a.score_threshold = th["score"]
+    if a.dist_threshold is None:
+        a.dist_threshold = th["dist_ip"]
     if not a.webhook:           # 명령줄 > 설정파일 순으로 웹훅 주소를 정한다
         a.webhook = th["webhook"]
 
@@ -376,6 +425,13 @@ def main():
     print("🟡 관찰" if watches else "🟡 관찰 없음")
     for r in watches:
         print("  " + fmt_screen(r))
+
+    # [v2] 서버 전체 관점 — 여러 IP 로 쪼갠 분산 공격
+    dist = detect_distributed(events, a.window, a.dist_threshold)
+    print()
+    print("🌐 분산 의심" if dist else "🌐 분산 의심 없음")
+    for d in dist:
+        print(f"  {d['kind']} — 서로 다른 IP {d['ips']}개 (한 {d['window']}초 창)")
 
     if a.alert_log and results:
         write_alert_log(a.alert_log, results)
