@@ -24,7 +24,7 @@ import re
 import time
 import urllib.request
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 
 # nginx/apache combined 로그 한 줄 파서
 _NGINX = re.compile(
@@ -237,24 +237,25 @@ def _max_in_window(times, window):
     return worst
 
 
-def _max_distinct_ips_in_window(timed_ips, window):
-    """(시각, IP) 목록에서 window 초 창 안의 '서로 다른 IP 최대 수'.
+def _max_distinct_in_window(timed_keys, window):
+    """(시각, 값) 목록에서 window 초 창 안의 '서로 다른 값 최대 수'.
 
-    창을 미끄러뜨리며(슬라이딩) 각 순간 창 안 IP 종류 수를 세고 그 최댓값을 돌려준다.
-    Counter 로 창에 남은 IP 만 센다(같은 IP 가 여러 번이면 1로).
+    창을 미끄러뜨리며(슬라이딩) 각 순간 창 안 값 종류 수를 세고 그 최댓값을 돌려준다.
+    값은 IP(분산 탐지)일 수도, 계정(스프레이 탐지)일 수도 있다 — 축만 바꿔 재사용.
+    Counter 로 창에 남은 값만 센다(같은 값이 여러 번이면 1로).
     """
     q = deque()
-    counts = defaultdict(int)   # 창 안에 살아있는 IP 별 등장 횟수
+    counts = defaultdict(int)   # 창 안에 살아있는 값별 등장 횟수
     worst = 0
-    for ts, ip in sorted(timed_ips):      # 시각 순
-        q.append((ts, ip))
-        counts[ip] += 1
+    for ts, key in sorted(timed_keys, key=lambda x: x[0]):   # 시각 순
+        q.append((ts, key))
+        counts[key] += 1
         while (ts - q[0][0]).total_seconds() > window:   # 창 밖은 버린다
             _, old = q.popleft()
             counts[old] -= 1
             if counts[old] == 0:
-                del counts[old]           # 창에서 완전히 빠진 IP 는 종류에서 제외
-        worst = max(worst, len(counts))   # 지금 창의 '서로 다른 IP 수'
+                del counts[old]           # 창에서 완전히 빠진 값은 종류에서 제외
+        worst = max(worst, len(counts))   # 지금 창의 '서로 다른 값 수'
     return worst
 
 
@@ -272,13 +273,94 @@ def detect_distributed(events, window, ip_threshold):
                if e["ts"] and e["ip"] not in _TRUSTED_IPS and e["status"] == 404
                and not any(e["path"].startswith(s) for s in _SKIP)]
     results = []
-    auth_ips = _max_distinct_ips_in_window(auth_hits, window)
+    auth_ips = _max_distinct_in_window(auth_hits, window)
     if auth_ips >= ip_threshold:
         results.append({"kind": "분산 무차별(인증실패)", "ips": auth_ips, "window": window})
-    nf_ips = _max_distinct_ips_in_window(nf_hits, window)
+    nf_ips = _max_distinct_in_window(nf_hits, window)
     if nf_ips >= ip_threshold:
         results.append({"kind": "분산 스캔(없는 주소)", "ips": nf_ips, "window": window})
     return results
+
+
+def analyze_logins(login_events, window, spray_threshold, account_threshold):
+    """[v2 미들웨어] 계정 차원 로그인 분석 — 접근 로그엔 없는 '계정' 신호를 본다.
+
+    login_events: 앱 미들웨어가 넘기는 로그인 시도 목록.
+        각 항목 = {"ts": datetime, "ip": str, "account": str, "success": bool}
+    실패한 시도만 본다. 두 가지를 잡는다(접근 로그 P1~P6 로는 안 보이던 것):
+      - 비밀번호 스프레이: 한 IP 가 window 초 안에 '서로 다른 계정' 여럿에 실패
+        (계정마다 1~2회뿐이라 계정 잠금도 안 걸리는 가로 공격)
+      - 계정 집중 공격: 한 계정에 window 초 안에 '서로 다른 IP' 여럿이 실패
+        (여러 곳에서 한 계정을 노리는 분산 브루트포스)
+    신뢰 IP 는 제외한다.
+    """
+    fails = [e for e in login_events
+             if not e.get("success") and e.get("ts") and e.get("ip") not in _TRUSTED_IPS]
+    results = []
+
+    # 스프레이: IP 별로 '그 IP 가 노린 서로 다른 계정 수'(시간창 안 최대)
+    by_ip = defaultdict(list)
+    for e in fails:
+        by_ip[e["ip"]].append((e["ts"], e["account"]))
+    for ip, timed_accounts in by_ip.items():
+        n = _max_distinct_in_window(timed_accounts, window)
+        if n >= spray_threshold:
+            results.append({"kind": "비밀번호 스프레이", "ip": ip,
+                            "accounts": n, "window": window})
+
+    # 집중: 계정 별로 '그 계정을 노린 서로 다른 IP 수'(시간창 안 최대)
+    by_account = defaultdict(list)
+    for e in fails:
+        by_account[e["account"]].append((e["ts"], e["ip"]))
+    for account, timed_ips in by_account.items():
+        n = _max_distinct_in_window(timed_ips, window)
+        if n >= account_threshold:
+            results.append({"kind": "계정 집중 공격", "account": account,
+                            "ips": n, "window": window})
+
+    results.sort(key=lambda r: -(r.get("accounts") or r.get("ips") or 0))
+    return results
+
+
+class LoginTracker:
+    """[v2 미들웨어] 앱에 드롭인하는 계정 차원 감시기.
+
+    접근 로그는 '어느 계정을 노렸나'를 안 남긴다. 그래서 이 감시기는 앱 안에서
+    로그인 시도를 직접 받아(record) 모아 두고, 주기적으로(check) 계정 차원 공격
+    (비밀번호 스프레이·계정 집중)을 점검한다. 대상 앱은 record/check 두 줄만 꽂으면 된다.
+
+    사용 예(FastAPI):
+        tracker = LoginTracker()
+        # 로그인 처리 직후
+        tracker.record(ip=request.client.host, account=login_id, success=ok)
+        # 주기적으로(백그라운드 작업 등)
+        for hit in tracker.check():
+            notify(hit)     # 슬랙/메일 등
+
+    메모리: keep_seconds 보다 오래된 시도는 버린다(무한 증가 방지).
+    """
+
+    def __init__(self, window=300, spray_threshold=5, account_threshold=5,
+                 keep_seconds=3600):
+        self.window = window                      # 분석 시간창(초)
+        self.spray_threshold = spray_threshold    # 스프레이: 한 IP 가 노린 서로 다른 계정 수
+        self.account_threshold = account_threshold  # 집중: 한 계정을 노린 서로 다른 IP 수
+        self.keep_seconds = keep_seconds          # 이보다 오래된 시도는 버린다
+        self._events = deque()
+
+    def record(self, ip, account, success, ts=None):
+        """로그인 시도 한 건을 기록한다(앱이 로그인 처리 직후 호출)."""
+        ts = ts or datetime.now(timezone.utc)
+        self._events.append({"ts": ts, "ip": ip, "account": account,
+                             "success": bool(success)})
+        while self._events and (ts - self._events[0]["ts"]).total_seconds() > self.keep_seconds:
+            self._events.popleft()                # 오래된 것 정리
+        return self
+
+    def check(self):
+        """지금까지 모인 시도에서 계정 차원 공격을 점검해 결과(목록)를 돌려준다."""
+        return analyze_logins(list(self._events), self.window,
+                              self.spray_threshold, self.account_threshold)
 
 
 def load_events(path, fmt):

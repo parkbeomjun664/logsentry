@@ -9,11 +9,12 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import logsentry
-from logsentry import (alert_key, analyze, detect_distributed, load_config,
-                       parse_line, send_webhook)
+from logsentry import (LoginTracker, alert_key, analyze, analyze_logins,
+                       detect_distributed, load_config, parse_line, send_webhook)
 
 # 기본 문턱(main 의 기본값과 같게)
 DEFAULTS = dict(window=60, probe_threshold=5, auth_threshold=5,
@@ -225,6 +226,54 @@ class TestDistributed(unittest.TestCase):
                        "/auth/login", 401, BROWSER) for n in range(3)]
         events = [e for e in (parse_line(l) for l in lines) if e]
         self.assertEqual(detect_distributed(events, 60, 5), [])
+
+
+class TestAccountDimension(unittest.TestCase):
+    """[v2 미들웨어] 계정 차원 — 접근 로그엔 없는 '어느 계정' 공격."""
+
+    BASE = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+
+    def _ev(self, ip, account, success, sec):
+        return {"ts": self.BASE + timedelta(seconds=sec), "ip": ip,
+                "account": account, "success": success}
+
+    def test_password_spray_detected(self):
+        """한 IP 가 짧은 시간에 여러 계정에 실패 → 비밀번호 스프레이."""
+        ev = [self._ev("6.6.6.6", f"user{n}", False, n * 3) for n in range(10)]
+        kinds = {h["kind"] for h in analyze_logins(ev, 60, 5, 5)}
+        self.assertIn("비밀번호 스프레이", kinds)
+
+    def test_account_focus_detected(self):
+        """한 계정에 여러 IP 가 실패 → 계정 집중 공격."""
+        ev = [self._ev(f"7.7.7.{n}", "admin", False, n * 3) for n in range(10)]
+        kinds = {h["kind"] for h in analyze_logins(ev, 60, 5, 5)}
+        self.assertIn("계정 집중 공격", kinds)
+
+    def test_normal_login_not_flagged(self):
+        """한 사람이 본인 계정 비번 몇 번 실수한 것은 공격 아님."""
+        ev = [self._ev("8.8.8.8", "me", False, n * 2) for n in range(3)]
+        self.assertEqual(analyze_logins(ev, 60, 5, 5), [])
+
+    def test_successful_logins_ignored(self):
+        """성공한 로그인은 세지 않는다(실패만 신호)."""
+        ev = [self._ev("6.6.6.6", f"user{n}", True, n * 3) for n in range(10)]
+        self.assertEqual(analyze_logins(ev, 60, 5, 5), [])
+
+    def test_login_tracker_record_and_check(self):
+        """드롭인 감시기: record 로 모아 check 로 스프레이를 잡는다."""
+        t = LoginTracker(window=60, spray_threshold=5, account_threshold=5)
+        for n in range(10):
+            t.record("6.6.6.6", f"user{n}", False,
+                     ts=self.BASE + timedelta(seconds=n * 2))
+        kinds = {h["kind"] for h in t.check()}
+        self.assertIn("비밀번호 스프레이", kinds)
+
+    def test_login_tracker_prunes_old(self):
+        """keep_seconds 보다 오래된 시도는 버려 메모리가 무한히 늘지 않는다."""
+        t = LoginTracker(keep_seconds=100)
+        t.record("1.1.1.1", "a", False, ts=self.BASE)
+        t.record("1.1.1.1", "b", False, ts=self.BASE + timedelta(seconds=200))
+        self.assertEqual(len(t._events), 1)   # 첫 건은 100초 넘어 버려짐
 
 
 if __name__ == "__main__":
