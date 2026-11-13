@@ -1,5 +1,7 @@
 # LogSentry
 
+![tests](https://github.com/parkbeomjun664/logsentry/actions/workflows/test.yml/badge.svg)
+
 표준 웹서버 접근 로그를 읽어 **침입 시도를 탐지·기록**하는 범용 도구.
 대상 앱의 코드를 고치지 않고, **어느 프로젝트든 로그만 있으면** 붙는다. 의존성 0(파이썬 표준 라이브러리만).
 
@@ -20,7 +22,7 @@ INFOLINK MES 보안 과제에서 만든 침입 탐지 규칙(계정 잠금·경�
 ## 핵심 특징
 
 - **코드 무수정** — 대상 앱을 전혀 건드리지 않는다. 로그 파일만 가리키면 된다.
-- **범용** — nginx/apache combined, JSON 접근 로그 지원. 양식은 파서(어댑터)만 추가하면 는다.
+- **범용** — nginx/apache combined, JSON 접근 로그 지원. 양식은 파서(어댑터)만 추가하면 늘어난다.
 - **의존성 0** — 파이썬 표준 라이브러리만. 어디서나 실행.
 - **자동 감시** — `--watch` 로 주기 재검사, 새 경보만 알림.
 - **기록** — `--alert-log` 로 경보를 ASCII 구조(key=value)로 남겨 어떤 인코딩·도구에서도 안 깨지고 파싱 가능.
@@ -48,8 +50,9 @@ python logsentry.py /var/log/nginx/access.log --watch 60 --alert-log alerts.txt
 python -m unittest -v
 ```
 
-스캐너·로그인 무차별·느린 분산 공격은 경보로 잡고, 정상 사용자·favicon 같은 소음은 잡지 않는지
-6가지 상황을 검사한다. 결과(경보 여부)뿐 아니라 셈(없는 주소 횟수 등)까지 확인해, 다른 점수에 가려
+스캐너·로그인 무차별·느린/복합/분산 공격은 경보로 잡고 정상 사용자·favicon 소음은 잡지 않는지,
+또 설정 적용·신뢰 IP 제외·웹훅 전송·계정 차원(스프레이·집중)까지 — 모두 **24가지 상황**을 검사한다.
+결과(경보 여부)뿐 아니라 셈(없는 주소 횟수 등)까지 확인해, 다른 점수에 가려
 고장이 조용히 지나가지 않게 했다.
 
 ## 탐지 규칙
@@ -84,7 +87,7 @@ LogSentry — 로그 26줄 분석
 파일 기록은 기계가 읽기 쉬운 형태로 남는다:
 
 ```
-[2026-11-10 09:50:16] ALERT ip=45.146.0.99 score=23 distinct_paths=7 notfound=7 authfail=0 probe_paths=7 tool_ua=1 rate=7 ...
+[2026-11-13 09:17:45] ALERT ip=45.146.0.99 score=32 distinct_paths=10 notfound=10 authfail=0 probe_paths=10 tool_ua=1 rate=10 first=2026-11-10T09:01 last=09:01
 ```
 
 ## 설계
