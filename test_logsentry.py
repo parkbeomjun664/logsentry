@@ -126,6 +126,19 @@ class TestDetection(unittest.TestCase):
         self.assertEqual(r["198.51.100.7"]["level"], "alert")
         self.assertEqual(r["198.51.100.7"]["auth"], 6)   # 401×4 + 423×2
 
+    def test_10_probe_path_detected_regardless_of_status(self):
+        """비표준 상태코드(307 등)여도 탐침 경로는 경로 패턴으로 잡힌다.
+
+        ShotTrace 검증: 없는 주소가 404 가 아니라 307(리다이렉트)로 나가도
+        /.env·/admin 같은 탐침 경로는 상태코드와 무관하게 탐지된다('경로 패턴은 살아남음').
+        """
+        lines = [nginx("45.1.1.1", f"09:00:0{i}", "GET", p, 307, "python-requests/2.31")
+                 for i, p in enumerate(PROBES)]
+        r = run(lines)
+        self.assertIn("45.1.1.1", r)
+        self.assertEqual(r["45.1.1.1"]["nf"], 0)             # 404 가 아니라 '없는 주소'는 0
+        self.assertGreaterEqual(r["45.1.1.1"]["probes"], 5)  # 그래도 탐침 경로로 잡힘
+
 
 class TestConfigAndAlerts(unittest.TestCase):
     """설정 파일·웹훅·감시 이름표 — 손으로만 확인하던 것을 테스트로 고정."""
@@ -274,6 +287,21 @@ class TestAccountDimension(unittest.TestCase):
         t.record("1.1.1.1", "a", False, ts=self.BASE)
         t.record("1.1.1.1", "b", False, ts=self.BASE + timedelta(seconds=200))
         self.assertEqual(len(t._events), 1)   # 첫 건은 100초 넘어 버려짐
+
+    def test_login_tracker_works_despite_http_200(self):
+        """상태코드 무관: 로그인 실패가 HTTP 200 이어도 잡는다(ShotTrace 치명 약점 ①의 해법).
+
+        ShotTrace(Next.js 서버액션)는 로그인 실패도 HTTP 200 이라 접근 로그 기반
+        인증 탐지(P2)가 무력했다. LoginTracker 는 상태코드가 아니라 앱이 판정한
+        success 를 직접 받으므로, 200 이든 307 이든 스프레이를 정확히 잡는다.
+        """
+        t = LoginTracker(window=60, spray_threshold=5, account_threshold=5)
+        for n in range(10):
+            # HTTP 응답은 200 이지만 앱이 판정한 success=False 로 기록
+            t.record("9.9.9.9", f"user{n}", success=False,
+                     ts=self.BASE + timedelta(seconds=n * 2))
+        kinds = {h["kind"] for h in t.check()}
+        self.assertIn("비밀번호 스프레이", kinds)
 
 
 if __name__ == "__main__":
