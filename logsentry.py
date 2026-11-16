@@ -282,16 +282,17 @@ def detect_distributed(events, window, ip_threshold):
     return results
 
 
-def analyze_logins(login_events, window, spray_threshold, account_threshold):
+def analyze_logins(login_events, window, spray_threshold, account_threshold,
+                   repeat_threshold):
     """[v2 미들웨어] 계정 차원 로그인 분석 — 접근 로그엔 없는 '계정' 신호를 본다.
 
     login_events: 앱 미들웨어가 넘기는 로그인 시도 목록.
         각 항목 = {"ts": datetime, "ip": str, "account": str, "success": bool}
-    실패한 시도만 본다. 두 가지를 잡는다(접근 로그 P1~P6 로는 안 보이던 것):
-      - 비밀번호 스프레이: 한 IP 가 window 초 안에 '서로 다른 계정' 여럿에 실패
-        (계정마다 1~2회뿐이라 계정 잠금도 안 걸리는 가로 공격)
-      - 계정 집중 공격: 한 계정에 window 초 안에 '서로 다른 IP' 여럿이 실패
-        (여러 곳에서 한 계정을 노리는 분산 브루트포스)
+    실패한 시도만 본다. 세 가지를 잡는다(접근 로그 P1~P6 로는 안 보이던 것):
+      - 비밀번호 스프레이: 한 IP 가 window 초 안에 '서로 다른 계정' 여럿에 실패(가로)
+      - 계정 집중 공격: 한 계정에 window 초 안에 '서로 다른 IP' 여럿이 실패(분산 세로)
+      - 단순 무차별: 한 (IP, 계정) 조합이 window 초 안에 '반복' 실패
+        (아이디는 그대로 두고 비밀번호만 바꿔 여러 번 — 가장 전형적인 로그인 공격)
     신뢰 IP 는 제외한다.
     """
     fails = [e for e in login_events
@@ -318,7 +319,17 @@ def analyze_logins(login_events, window, spray_threshold, account_threshold):
             results.append({"kind": "계정 집중 공격", "account": account,
                             "ips": n, "window": window})
 
-    results.sort(key=lambda r: -(r.get("accounts") or r.get("ips") or 0))
+    # 단순 무차별: (IP, 계정) 조합별 '반복 실패 횟수'(시간창 안 최대)
+    by_pair = defaultdict(list)
+    for e in fails:
+        by_pair[(e["ip"], e["account"])].append(e["ts"])
+    for (ip, account), times in by_pair.items():
+        n = _max_in_window(sorted(times), window)
+        if n >= repeat_threshold:
+            results.append({"kind": "단순 무차별", "ip": ip, "account": account,
+                            "count": n, "window": window})
+
+    results.sort(key=lambda r: -(r.get("accounts") or r.get("ips") or r.get("count") or 0))
     return results
 
 
@@ -341,10 +352,11 @@ class LoginTracker:
     """
 
     def __init__(self, window=300, spray_threshold=5, account_threshold=5,
-                 keep_seconds=3600):
+                 repeat_threshold=5, keep_seconds=3600):
         self.window = window                      # 분석 시간창(초)
         self.spray_threshold = spray_threshold    # 스프레이: 한 IP 가 노린 서로 다른 계정 수
         self.account_threshold = account_threshold  # 집중: 한 계정을 노린 서로 다른 IP 수
+        self.repeat_threshold = repeat_threshold  # 단순 무차별: 한 (IP,계정) 반복 실패 횟수
         self.keep_seconds = keep_seconds          # 이보다 오래된 시도는 버린다
         self._events = deque()
 
@@ -360,7 +372,8 @@ class LoginTracker:
     def check(self):
         """지금까지 모인 시도에서 계정 차원 공격을 점검해 결과(목록)를 돌려준다."""
         return analyze_logins(list(self._events), self.window,
-                              self.spray_threshold, self.account_threshold)
+                              self.spray_threshold, self.account_threshold,
+                              self.repeat_threshold)
 
 
 def load_events(path, fmt):

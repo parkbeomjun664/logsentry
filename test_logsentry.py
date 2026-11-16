@@ -253,24 +253,42 @@ class TestAccountDimension(unittest.TestCase):
     def test_password_spray_detected(self):
         """한 IP 가 짧은 시간에 여러 계정에 실패 → 비밀번호 스프레이."""
         ev = [self._ev("6.6.6.6", f"user{n}", False, n * 3) for n in range(10)]
-        kinds = {h["kind"] for h in analyze_logins(ev, 60, 5, 5)}
+        kinds = {h["kind"] for h in analyze_logins(ev, 60, 5, 5, 5)}
         self.assertIn("비밀번호 스프레이", kinds)
 
     def test_account_focus_detected(self):
         """한 계정에 여러 IP 가 실패 → 계정 집중 공격."""
         ev = [self._ev(f"7.7.7.{n}", "admin", False, n * 3) for n in range(10)]
-        kinds = {h["kind"] for h in analyze_logins(ev, 60, 5, 5)}
+        kinds = {h["kind"] for h in analyze_logins(ev, 60, 5, 5, 5)}
         self.assertIn("계정 집중 공격", kinds)
 
     def test_normal_login_not_flagged(self):
         """한 사람이 본인 계정 비번 몇 번 실수한 것은 공격 아님."""
         ev = [self._ev("8.8.8.8", "me", False, n * 2) for n in range(3)]
-        self.assertEqual(analyze_logins(ev, 60, 5, 5), [])
+        self.assertEqual(analyze_logins(ev, 60, 5, 5, 5), [])
 
     def test_successful_logins_ignored(self):
         """성공한 로그인은 세지 않는다(실패만 신호)."""
         ev = [self._ev("6.6.6.6", f"user{n}", True, n * 3) for n in range(10)]
-        self.assertEqual(analyze_logins(ev, 60, 5, 5), [])
+        self.assertEqual(analyze_logins(ev, 60, 5, 5, 5), [])
+
+    def test_simple_bruteforce_detected(self):
+        """아이디 그대로 비밀번호만 바꿔 반복(한 IP+계정 반복)도 잡는다.
+
+        스프레이(서로 다른 계정)·집중(서로 다른 IP) 어디에도 안 걸리던 빈틈 —
+        가장 전형적인 로그인 무차별. (ShotTrace 운영 검증서 발견)
+        """
+        ev = [self._ev("9.9.9.9", "admin", False, n * 2) for n in range(6)]
+        kinds = {h["kind"] for h in analyze_logins(ev, 60, 5, 5, 5)}
+        self.assertIn("단순 무차별", kinds)
+        # 스프레이(계정 1개)·집중(IP 1개)에는 해당 안 됨
+        self.assertNotIn("비밀번호 스프레이", kinds)
+        self.assertNotIn("계정 집중 공격", kinds)
+
+    def test_bruteforce_below_threshold_not_flagged(self):
+        """반복이 문턱 미만이면(비번 몇 번 실수) 공격 아님 — 오탐 방지."""
+        ev = [self._ev("9.9.9.9", "admin", False, n * 2) for n in range(4)]
+        self.assertEqual(analyze_logins(ev, 60, 5, 5, 5), [])
 
     def test_login_tracker_record_and_check(self):
         """드롭인 감시기: record 로 모아 check 로 스프레이를 잡는다."""
