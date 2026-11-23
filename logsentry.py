@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -601,6 +602,15 @@ def open_db(path):
         "ts TEXT, ip TEXT, path TEXT, status INTEGER, method TEXT, ua TEXT,"
         "kind TEXT, severity TEXT, seen_at TEXT,"
         "UNIQUE(ts, ip, path, status))")   # 같은 요청 중복 저장 방지
+    # 차단한 IP 목록(되돌리기용 active 플래그 포함)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS blocklist("
+        "ip TEXT PRIMARY KEY, reason TEXT, blocked_at TEXT, rule_name TEXT,"
+        "active INTEGER DEFAULT 1)")
+    # 차단·해제 시도 감사기록(언제·어느 IP·무엇을·결과) — 이력/책임 추적
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS block_audit("
+        "ts TEXT, ip TEXT, action TEXT, result TEXT, detail TEXT)")
     conn.commit()
     return conn
 
@@ -642,6 +652,141 @@ def recent_intrusions(conn, limit=60):
             dt = None
         out.append(_timeline_entry(_fmt_time(dt), ts, ip, path, method, status, ua, kind))
     return out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# IP 차단 엔진 — 상황판의 '이 IP 차단' 버튼이 호출. 실제 Windows 방화벽을 조작한다.
+#   안전장치: ① IP 형식 엄격 검증(명령어 주입 차단)  ② 자기자신·링크로컬 거부
+#            ③ 모든 시도를 감사기록(block_audit)에 남김  ④ 되돌리기(차단 해제) 지원
+# ──────────────────────────────────────────────────────────────────────────
+_IPV4 = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+
+
+def _valid_ipv4(ip):
+    """엄격한 IPv4 검사 — 숫자·점 외의 것은 전부 거부(그래서 명령어 주입이 불가능)."""
+    m = _IPV4.match(ip or "")
+    return bool(m) and all(0 <= int(g) <= 255 for g in m.groups())
+
+
+def _is_private(ip):
+    """사설망 IP(10/172.16~31/192.168)인가 — 차단 시 '사내 직원일 수 있음' 경고용."""
+    o = [int(x) for x in ip.split(".")]
+    return o[0] == 10 or (o[0] == 172 and 16 <= o[1] <= 31) or (o[0] == 192 and o[1] == 168)
+
+
+def _block_refusal(ip):
+    """차단하면 안 되는 IP 면 거부 사유(문자열), 괜찮으면 None 을 돌려준다."""
+    if not _valid_ipv4(ip):
+        return "IP 형식이 올바르지 않습니다 (IPv4 가 아님) — 차단하지 않습니다."
+    o = [int(x) for x in ip.split(".")]
+    if o[0] == 127:
+        return "로컬(127.x)은 '당신 자신'입니다 — 차단하면 스스로를 막습니다. 거부합니다."
+    if o[0] == 169 and o[1] == 254:
+        return "링크-로컬(169.254.x)은 차단 대상이 아닙니다 — 거부합니다."
+    if o == [0, 0, 0, 0] or o[0] == 0:
+        return "0.x 주소는 차단할 수 없습니다 — 거부합니다."
+    return None
+
+
+def _rule_name(ip):
+    return f"LogSentry-block-{ip}"
+
+
+def _run_netsh(args):
+    """netsh 를 '셸 없이' 실행(리스트 인자 → 명령어 주입 불가). (종료코드, 메시지) 반환."""
+    if os.name != "nt":
+        return 1, "이 기능은 Windows 방화벽(netsh)에서만 동작합니다."
+    try:
+        r = subprocess.run(["netsh", *args], capture_output=True, timeout=10)
+    except FileNotFoundError:
+        return 1, "netsh 를 찾을 수 없습니다."
+    except subprocess.TimeoutExpired:
+        return 1, "netsh 응답 시간 초과."
+    raw = (r.stdout or b"") + b"\n" + (r.stderr or b"")
+    msg = raw.decode("cp949", "replace").strip() if os.name == "nt" else raw.decode("utf-8", "replace").strip()
+    return r.returncode, msg
+
+
+def _audit(db_path, ip, action, result, detail):
+    """차단·해제 시도를 감사기록 표에 남긴다(실패해도 본 기능은 멈추지 않음)."""
+    if not db_path:
+        return
+    try:
+        conn = open_db(db_path)
+        conn.execute(
+            "INSERT INTO block_audit(ts, ip, action, result, detail) VALUES(?,?,?,?,?)",
+            (datetime.now().isoformat(timespec="seconds"), ip, action, result, (detail or "")[:300]))
+        conn.commit()
+        conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def block_ip(db_path, ip, reason=""):
+    """IP 를 실제로 차단(Windows 방화벽 inbound 규칙 추가). 결과 dict 반환."""
+    refuse = _block_refusal(ip)
+    if refuse:
+        _audit(db_path, ip, "block", "refused", refuse)
+        return {"ok": False, "ip": ip, "status": "refused", "message": refuse}
+    rc, msg = _run_netsh(["advfirewall", "firewall", "add", "rule",
+                          f"name={_rule_name(ip)}", "dir=in", "action=block",
+                          f"remoteip={ip}"])
+    if rc == 0:
+        if db_path:
+            try:
+                conn = open_db(db_path)
+                conn.execute(
+                    "INSERT OR REPLACE INTO blocklist(ip, reason, blocked_at, rule_name, active)"
+                    " VALUES(?,?,?,?,1)",
+                    (ip, reason, datetime.now().isoformat(timespec="seconds"), _rule_name(ip)))
+                conn.commit()
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _audit(db_path, ip, "block", "ok", msg)
+        return {"ok": True, "ip": ip, "status": "blocked", "private": _is_private(ip),
+                "message": f"차단 완료 — {ip} 의 들어오는 연결을 방화벽에서 막았습니다."
+                           + ("  ⚠ 사설 IP라 사내 직원일 수 있으니 확인하세요." if _is_private(ip) else "")}
+    low = msg.lower()
+    if any(k in msg for k in ("권한", "액세스", "관리자")) or any(k in low for k in ("elevat", "administrator", "denied", "requires")):
+        hint = "실제 차단 실패 — 상황판을 '관리자 권한'으로 실행해야 방화벽을 바꿀 수 있습니다."
+    else:
+        hint = "방화벽 명령 실행에 실패했습니다."
+    _audit(db_path, ip, "block", "failed", msg)
+    return {"ok": False, "ip": ip, "status": "failed", "message": hint, "detail": msg[:200]}
+
+
+def unblock_ip(db_path, ip):
+    """차단했던 IP 를 되돌린다(방화벽 규칙 삭제)."""
+    if not _valid_ipv4(ip):
+        return {"ok": False, "ip": ip, "status": "refused", "message": "IP 형식이 올바르지 않습니다."}
+    rc, msg = _run_netsh(["advfirewall", "firewall", "delete", "rule", f"name={_rule_name(ip)}"])
+    ok = rc == 0
+    if db_path:
+        try:
+            conn = open_db(db_path)
+            conn.execute("UPDATE blocklist SET active=0 WHERE ip=?", (ip,))
+            conn.commit()
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _audit(db_path, ip, "unblock", "ok" if ok else "failed", msg)
+    return {"ok": ok, "ip": ip, "status": "unblocked" if ok else "failed",
+            "message": "차단 해제 완료 — 다시 연결을 허용합니다." if ok
+                       else "해제 실패(관리자 권한이 필요할 수 있습니다)."}
+
+
+def load_blocked(db_path):
+    """현재 차단 중인 IP 집합(상황판 켤 때 DB 에서 복원)."""
+    if not db_path or not os.path.exists(db_path):
+        return set()
+    try:
+        conn = open_db(db_path)
+        rows = conn.execute("SELECT ip FROM blocklist WHERE active=1").fetchall()
+        conn.close()
+        return {r[0] for r in rows}
+    except Exception:  # noqa: BLE001
+        return set()
 
 
 def print_db(path, limit):
@@ -804,6 +949,32 @@ _DASHBOARD_HTML = """<!doctype html>
   .sev { padding:2px 10px; border-radius:20px; font-size:12px; font-weight:600; }
   .sev.danger { background:var(--bdg-d-bg); color:var(--bdg-d-fg); }
   .sev.warn { background:var(--bdg-w-bg); color:var(--bdg-w-fg); }
+  /* 종류별 보기 탭 */
+  .filters { display:flex; flex-wrap:wrap; gap:8px; margin:4px 4px 14px; }
+  .fbtn { background:var(--btn-bg); color:var(--btn-fg); border:1px solid var(--border2);
+          border-radius:20px; padding:5px 13px; font-size:12.5px; cursor:pointer; }
+  .fbtn:hover { border-color:var(--accent); }
+  .fbtn.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .fbtn b { font-weight:700; margin-left:3px; }
+  .badge.blk { background:var(--bdg-d-bg); color:var(--bdg-d-fg); margin-left:6px; }
+  /* 차단된 IP 띠(되돌리기 버튼 포함) */
+  #blocked { padding:0 20px; }
+  .bstrip { background:var(--bdg-d-bg); border:1px solid var(--bdg-d-fg); border-radius:8px;
+            padding:9px 12px; margin-bottom:10px; font-size:13px;
+            display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .blab { color:var(--bdg-d-fg); font-weight:600; }
+  .bchip { background:var(--panel); border:1px solid var(--border2); border-radius:16px;
+           padding:3px 6px 3px 11px; font-family:ui-monospace,Consolas,monospace; font-size:12.5px;
+           display:inline-flex; align-items:center; gap:7px; }
+  .bchip button { background:var(--btn-bg); color:var(--btn-fg); border:1px solid var(--border2);
+                  border-radius:12px; padding:1px 9px; font-size:11px; cursor:pointer; }
+  /* 상세창 안의 실제 조치 버튼 */
+  .actions { margin-top:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .actbtn { border:none; border-radius:8px; padding:9px 16px; font-size:13.5px; font-weight:600; cursor:pointer; }
+  .actbtn.block { background:var(--danger); color:#fff; }
+  .actbtn.unblock { background:var(--green); color:#fff; }
+  .actbtn:hover { opacity:.9; }
+  .ahint { font-size:11.5px; color:var(--faint); line-height:1.45; max-width:340px; }
 </style>
 </head>
 <body>
@@ -823,16 +994,19 @@ _DASHBOARD_HTML = """<!doctype html>
   </div>
 
   <div id="dist"></div>
+  <div id="blocked"></div>
 
   <div class="wrap">
-    <h2>실시간 공격 타임라인 <span style="color:#6e7681;font-weight:400">· 최근 공격부터 · 줄을 클릭하면 상세·대응 추천</span></h2>
+    <h2>종류별로 보기 <span style="color:#6e7681;font-weight:400">· 탭을 누르면 그 유형만 추립니다</span></h2>
+    <div id="filters" class="filters"></div>
+    <h2>실시간 공격 타임라인 <span style="color:#6e7681;font-weight:400">· 최근 공격부터 · 줄을 클릭하면 상세·대응·차단</span></h2>
     <table>
       <thead><tr><th>시각</th><th>IP</th><th>노린 경로</th><th>유형</th><th>상태</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
   </div>
 
-  <footer>LogSentry · 읽기 전용(서버를 건드리지 않음) · 침투 흔적은 DB에 영구 저장 · 3초마다 자동 새로고침</footer>
+  <footer>LogSentry · 탐지·기록 + 선택적 IP 차단(관리자 권한 시 실제 방화벽 조작) · 침투 흔적·차단 내역은 DB에 영구 저장 · 3초마다 자동 새로고침</footer>
 
   <div id="overlay" onclick="if(event.target===this)closeDetail()">
     <div class="modal">
@@ -865,6 +1039,11 @@ function setStatus(ok, t){
     : '<span class="dot" style="background:#f85149"></span>연결 끊김 — 재시도 중';
 }
 
+var LAST = [];          // 최근 타임라인(상세창·필터에서 꺼내 씀)
+var BLOCKED = [];       // 현재 차단 중인 IP 목록
+var FILTER = '전체';    // 지금 고른 종류별 필터
+var KINDS = [];         // 탭에 뜬 종류 순서
+
 function render(d){
   document.getElementById('attempt').textContent = d.attempt_count;
   document.getElementById('warn').textContent    = d.watch_count;
@@ -877,27 +1056,91 @@ function render(d){
          + x.ips + '개 (한 ' + x.window + '초 창)</div>';
   }).join('');
 
-  var ev = d.timeline || [];
-  LAST = ev;                                     // 상세창에서 꺼내 쓰려고 보관
-  var tb = document.getElementById('rows');
-  if(!ev.length){
-    tb.innerHTML = '<tr><td colspan="5" class="empty">아직 탐지된 공격 요청이 없습니다 👍</td></tr>';
-    return;
-  }
-  tb.innerHTML = ev.map(function(e, i){
+  LAST = d.timeline || [];
+  BLOCKED = d.blocked || [];
+  renderBlocked();
+  renderFilters();
+  renderRows();
+}
+
+// 차단된 IP 띠 — 각 IP 옆에 '해제'(되돌리기) 버튼
+function renderBlocked(){
+  var el = document.getElementById('blocked');
+  if(!BLOCKED.length){ el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="bstrip"><span class="blab">🚫 차단된 IP ('
+    + BLOCKED.length + ')</span>'
+    + BLOCKED.map(function(ip){
+        return '<span class="bchip">' + esc(ip)
+          + '<button onclick="unblockIp(&#39;' + esc(ip) + '&#39;)">해제</button></span>';
+      }).join('')
+    + '</div>';
+}
+
+// 종류별 보기 탭 — 현재 타임라인에서 유형별 개수를 세어 버튼으로
+function renderFilters(){
+  var counts = {}, order = [];
+  LAST.forEach(function(e){
+    if(!(e.kind in counts)){ counts[e.kind] = 0; order.push(e.kind); }
+    counts[e.kind]++;
+  });
+  KINDS = order;
+  if(FILTER !== '전체' && order.indexOf(FILTER) < 0){ FILTER = '전체'; }
+  var h = '<button class="fbtn' + (FILTER === '전체' ? ' on' : '')
+        + '" onclick="setFilter(-1)">전체<b>' + LAST.length + '</b></button>';
+  order.forEach(function(k, idx){
+    h += '<button class="fbtn' + (FILTER === k ? ' on' : '')
+       + '" onclick="setFilter(' + idx + ')">' + esc(k) + '<b>' + counts[k] + '</b></button>';
+  });
+  document.getElementById('filters').innerHTML = h;
+}
+function setFilter(idx){ FILTER = (idx < 0) ? '전체' : KINDS[idx]; renderFilters(); renderRows(); }
+
+// 타임라인 표 — FILTER 로 추려 그린다(원래 인덱스를 유지해 상세창이 정확히 열림)
+function renderRows(){
+  var out = [];
+  for(var i = 0; i < LAST.length; i++){
+    var e = LAST[i];
+    if(FILTER !== '전체' && e.kind !== FILTER){ continue; }
     var cls = e.severity === '위험' ? 'alert' : 'watch';   // 위험=빨강, 경고=주황
     var tool = e.tool ? ' <span class="badge watch">도구</span>' : '';
-    return '<tr class="clk ' + cls + '" onclick="openDetail(' + i + ')">'
+    var blk = (BLOCKED.indexOf(e.ip) >= 0) ? ' <span class="badge blk">차단됨</span>' : '';
+    out.push('<tr class="clk ' + cls + '" onclick="openDetail(' + i + ')">'
       + '<td class="ip">' + esc(e.time) + '</td>'
-      + '<td class="ip">' + esc(e.ip) + '</td>'
+      + '<td class="ip">' + esc(e.ip) + blk + '</td>'
       + '<td class="path">' + esc(e.path) + '</td>'
       + '<td>' + esc(e.kind) + tool + '</td>'
       + '<td class="st">' + e.status + '</td>'
-      + '</tr>';
-  }).join('');
+      + '</tr>');
+  }
+  document.getElementById('rows').innerHTML = out.length ? out.join('')
+    : '<tr><td colspan="5" class="empty">해당 종류의 공격 기록이 없습니다 👍</td></tr>';
 }
 
-var LAST = [];
+// 실제 차단/해제 — 확인창 후 서버에 요청(서버가 자기자신·사설IP·권한을 최종 판단)
+function blockIp(ip){
+  if(!confirm('정말 ' + ip + ' 를 차단할까요?\\n\\n'
+    + '· 윈도우 방화벽에서 이 IP의 "들어오는 연결"을 막습니다\\n'
+    + '· 실제 차단은 관리자 권한이 필요합니다\\n'
+    + '· 자기자신(127.x)·사설 IP는 거부되거나 경고됩니다\\n'
+    + '· 언제든 "해제"로 되돌릴 수 있습니다')){ return; }
+  fetch('/api/block', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ip: ip})})
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      alert((res.ok ? '✅ ' : '⚠ ') + (res.message || '')
+        + (res.detail ? ('\\n\\n상세: ' + res.detail) : ''));
+      closeDetail(); tick();
+    })
+    .catch(function(){ alert('요청 실패 — 서버 연결을 확인하세요.'); });
+}
+function unblockIp(ip){
+  if(!confirm(ip + ' 차단을 해제할까요? (다시 연결을 허용합니다)')){ return; }
+  fetch('/api/unblock', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ip: ip})})
+    .then(function(r){ return r.json(); })
+    .then(function(res){ alert((res.ok ? '✅ ' : '⚠ ') + (res.message || '')); closeDetail(); tick(); })
+    .catch(function(){ alert('요청 실패 — 서버 연결을 확인하세요.'); });
+}
 function openDetail(i){
   var e = LAST[i]; if(!e) return;
   var sc = e.severity === '위험' ? 'danger' : 'warn';
@@ -924,6 +1167,13 @@ function openDetail(i){
     +   (rec.block_cmd ? '<div class="cmd"><button onclick="copyCmd(this)">복사</button>'
           + esc(rec.block_cmd) + '</div>' : '')
     +   (rec.caution ? '<div class="caution">⚠ ' + esc(rec.caution) + '</div>' : '')
+    + '</div>'
+    + '<div class="actions">'
+    +   ((BLOCKED.indexOf(e.ip) >= 0)
+          ? '<button class="actbtn unblock" onclick="unblockIp(&#39;' + esc(e.ip) + '&#39;)">✅ 이 IP 차단 해제</button>'
+          : '<button class="actbtn block" onclick="blockIp(&#39;' + esc(e.ip) + '&#39;)">🚫 이 IP 차단</button>')
+    +   '<span class="ahint">실제 윈도우 방화벽을 조작합니다 · 관리자 권한 필요 · '
+    +     '자기자신/사설IP는 거부 · 되돌리기 가능</span>'
     + '</div>';
   document.getElementById('overlay').classList.add('on');
 }
@@ -954,11 +1204,14 @@ def run_dashboard(a):
     외부 라이브러리 0. 파이썬 표준 http.server 만 쓴다.
     바인드 주소 기본값은 127.0.0.1(이 PC에서만 열람) — 사내망 공유는 --host 0.0.0.0.
     """
-    state = {"payload": build_dashboard_payload([], [])}   # 공유 저장소
+    state = {"payload": build_dashboard_payload([], []),   # 공유 저장소
+             "blocked": load_blocked(a.db)}                # 현재 차단 중인 IP(재시작해도 복원)
     lock = threading.Lock()                                # 스레드 간 안전장치
 
     if a.db:
         print(f"침투 흔적 DB: {a.db} (영구 저장)")
+    if state["blocked"]:
+        print(f"차단 중인 IP 복원: {len(state['blocked'])}개")
 
     def scanner():
         """백그라운드: scan_interval 초마다 로그를 다시 읽어 최신 경보로 갱신.
@@ -1000,13 +1253,45 @@ def run_dashboard(a):
         def do_GET(self):   # noqa: N802 (http.server 가 정한 이름)
             if self.path.startswith("/api/alerts"):
                 with lock:
-                    body = json.dumps(state["payload"], ensure_ascii=False).encode("utf-8")
+                    resp = dict(state["payload"])                 # 얕은 복사 후
+                    resp["blocked"] = sorted(state["blocked"])    # 현재 차단 목록을 끼워 보냄
+                body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+            elif self.path.startswith("/api/blocks"):
+                with lock:
+                    body = json.dumps({"blocked": sorted(state["blocked"])},
+                                      ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
             elif self.path == "/" or self.path.startswith("/?"):
                 self._send(200, _DASHBOARD_HTML.encode("utf-8"),
                            "text/html; charset=utf-8")
             else:
                 self._send(404, b"not found", "text/plain; charset=utf-8")
+
+        def do_POST(self):   # noqa: N802 — '이 IP 차단/해제' 버튼이 부르는 창구
+            if self.path not in ("/api/block", "/api/unblock"):
+                self._send(404, b"not found", "text/plain; charset=utf-8")
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                data = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:  # noqa: BLE001 — 깨진 요청은 400 으로
+                self._send(400, '{"ok":false,"message":"잘못된 요청입니다."}'.encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            ip = (data.get("ip") or "").strip()
+            if self.path == "/api/block":
+                res = block_ip(a.db, ip, data.get("reason") or "상황판에서 차단")
+                if res.get("ok"):
+                    with lock:
+                        state["blocked"].add(ip)
+            else:
+                res = unblock_ip(a.db, ip)
+                if res.get("ok"):
+                    with lock:
+                        state["blocked"].discard(ip)
+            self._send(200, json.dumps(res, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
 
         def log_message(self, *args):   # 상황판 자신의 접근 로그는 콘솔에 찍지 않는다
             pass

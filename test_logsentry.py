@@ -13,7 +13,8 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import logsentry
-from logsentry import (LoginTracker, alert_key, analyze, analyze_logins,
+from logsentry import (LoginTracker, _block_refusal, _is_private, _valid_ipv4,
+                       alert_key, analyze, analyze_logins, block_ip,
                        build_dashboard_payload, build_timeline, detect_distributed,
                        load_config, open_db, parse_line, recent_intrusions,
                        recommend, send_webhook, store_events)
@@ -379,6 +380,52 @@ class TestDashboardAndDB(unittest.TestCase):
             self.assertEqual(tl[0]["ip"], "203.0.113.77")   # 최근 건이 맨 위
         finally:
             conn.close()
+            os.remove(path)
+
+
+class TestBlocking(unittest.TestCase):
+    """[v3] IP 차단 — 안전장치 검증. 실제 방화벽(netsh)은 건드리지 않는 선에서."""
+
+    def test_valid_ipv4_strict(self):
+        """정상 IPv4만 통과 — 주입 문자열·범위초과·형식오류는 거부(명령어 주입 차단)."""
+        self.assertTrue(_valid_ipv4("203.0.113.77"))
+        for bad in ("999.1.1.1", "1.2.3", "a.b.c.d", "1.1.1.1; calc", "", "127.0.0.1 && del"):
+            self.assertFalse(_valid_ipv4(bad), bad)
+
+    def test_refuse_self_and_linklocal(self):
+        """자기자신(127.x)·링크로컬(169.254.x)·형식오류는 차단을 거부한다."""
+        self.assertIsNone(_block_refusal("203.0.113.77"))     # 공인 IP는 차단 가능
+        self.assertIsNotNone(_block_refusal("127.0.0.1"))     # 나 자신 → 거부
+        self.assertIsNotNone(_block_refusal("169.254.1.1"))   # 링크로컬 → 거부
+        self.assertIsNotNone(_block_refusal("bad"))           # 형식오류 → 거부
+
+    def test_is_private(self):
+        """사설망 판별(사내 직원 경고용)."""
+        for ip in ("10.0.0.5", "172.16.3.4", "192.168.1.9"):
+            self.assertTrue(_is_private(ip), ip)
+        self.assertFalse(_is_private("203.0.113.77"))
+
+    def test_block_refused_does_not_run_firewall(self):
+        """거부 대상(127.x·주입 문자열)은 netsh 를 부르지 않고 'refused'로 돌려준다."""
+        r1 = block_ip("", "127.0.0.1")
+        self.assertFalse(r1["ok"])
+        self.assertEqual(r1["status"], "refused")
+        r2 = block_ip("", "1.1.1.1; calc")        # 명령어 주입 시도
+        self.assertEqual(r2["status"], "refused")
+
+    def test_block_attempt_is_audited(self):
+        """차단 시도는 결과와 무관하게 감사기록(block_audit)에 남는다 — 이력 추적."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            block_ip(path, "127.0.0.1")           # 거부되지만 기록은 남아야 함
+            conn = open_db(path)
+            rows = conn.execute("SELECT ip, action, result FROM block_audit").fetchall()
+            conn.close()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][1], "block")
+            self.assertEqual(rows[0][2], "refused")
+        finally:
             os.remove(path)
 
 
