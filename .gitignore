@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 logsentry.json
 infolink_access.log
+demo_live.log
+demo_feed.py
+*.db

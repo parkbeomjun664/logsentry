@@ -14,7 +14,9 @@ from unittest import mock
 
 import logsentry
 from logsentry import (LoginTracker, alert_key, analyze, analyze_logins,
-                       detect_distributed, load_config, parse_line, send_webhook)
+                       build_dashboard_payload, build_timeline, detect_distributed,
+                       load_config, open_db, parse_line, recent_intrusions,
+                       recommend, send_webhook, store_events)
 
 # 기본 문턱(main 의 기본값과 같게)
 DEFAULTS = dict(window=60, probe_threshold=5, auth_threshold=5,
@@ -320,6 +322,64 @@ class TestAccountDimension(unittest.TestCase):
                      ts=self.BASE + timedelta(seconds=n * 2))
         kinds = {h["kind"] for h in t.check()}
         self.assertIn("비밀번호 스프레이", kinds)
+
+
+class TestDashboardAndDB(unittest.TestCase):
+    """[v2 상황판] 대응 추천·침투 흔적 DB·타임라인 — 대표님 요청 기능."""
+
+    def _events(self):
+        """공격자 1명이 탐침 경로 6개(404)를 쑤시고, 중간에 정상 소음(favicon) 한 건."""
+        lines = [nginx("203.0.113.77", f"09:00:0{i}", "GET", p, 404, "python-requests/2.31")
+                 for i, p in enumerate(PROBES)]
+        lines.append(nginx("203.0.113.77", "09:00:30", "GET", "/favicon.ico", 404,
+                           "python-requests/2.31"))   # 정상 소음 — 세면 안 됨
+        return [e for e in (parse_line(l) for l in lines) if e]
+
+    def test_payload_counts_each_request_once(self):
+        """공격 요청(건)=없는주소+인증거부 — 탐침을 중복으로 두 번 세어 부풀리지 않는다."""
+        results = analyze(self._events(), **DEFAULTS)
+        p = build_dashboard_payload(results, [], [])
+        self.assertEqual(p["attempt_count"], 6)   # 404 6건(탐침 6을 더해 12로 부풀면 안 됨)
+        self.assertEqual(p["ip_count"], 1)
+
+    def test_timeline_newest_first_and_skips_noise(self):
+        """타임라인은 최근 공격이 맨 위, 정상 소음(favicon)은 제외."""
+        tl = build_timeline(self._events(), 60)
+        self.assertEqual(len(tl), 6)                            # favicon 제외 6건
+        times = [row["time"] for row in tl]
+        self.assertEqual(times, sorted(times, reverse=True))   # 내림차순(최근 먼저)
+        self.assertTrue(all("favicon" not in row["path"] for row in tl))
+
+    def test_recommend_has_actions_and_block_command(self):
+        """추천은 조치 목록과, 그 IP 를 박은 Windows 차단 명령을 준다."""
+        rec = recommend("203.0.113.77", "/.env", 404, "python-requests/2.31", "탐침경로")
+        self.assertEqual(rec["severity"], "위험")
+        self.assertTrue(rec["actions"])                        # 조치가 비어있지 않음
+        self.assertIn("203.0.113.77", rec["block_cmd"])        # 차단 명령에 그 IP
+        self.assertIn("action=block", rec["block_cmd"])
+
+    def test_auth_fail_is_warning_level_recommend(self):
+        """인증거부도 '위험', 없는 주소(정찰)는 '경고'로 심각도를 나눈다."""
+        self.assertEqual(recommend("1.1.1.1", "/x", 401, "curl", "인증거부")["severity"], "위험")
+        self.assertEqual(recommend("1.1.1.1", "/x", 404, "curl", "없는 주소")["severity"], "경고")
+
+    def test_db_stores_and_dedupes(self):
+        """같은 공격을 두 번 저장해도 DB 는 중복을 무시한다(UNIQUE). 흔적은 영구 보존."""
+        ev = self._events()
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        conn = open_db(path)
+        try:
+            first = store_events(conn, ev)
+            second = store_events(conn, ev)            # 똑같은 걸 다시 저장
+            self.assertEqual(first, 6)                 # 수상한 6건 저장(favicon 제외)
+            self.assertEqual(second, 0)                # 중복은 0건(안 쌓임)
+            tl = recent_intrusions(conn, 60)
+            self.assertEqual(len(tl), 6)
+            self.assertEqual(tl[0]["ip"], "203.0.113.77")   # 최근 건이 맨 위
+        finally:
+            conn.close()
+            os.remove(path)
 
 
 if __name__ == "__main__":

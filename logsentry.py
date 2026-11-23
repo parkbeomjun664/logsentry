@@ -21,10 +21,22 @@ import argparse
 import json
 import os
 import re
+import sqlite3
+import sys
+import threading
 import time
 import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+# Windows 콘솔(cp949 등)에서 한글·이모지 출력이 깨지거나 터지지 않도록 UTF-8 로 맞춘다.
+# MES 서버도 Windows 라, 설정 파일 로드 시 이모지(⚙) 출력에서 죽는 일을 막는 안전장치.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 — 재설정이 안 되는 환경이면 조용히 넘어간다
+        pass
 
 # nginx/apache combined 로그 한 줄 파서
 _NGINX = re.compile(
@@ -470,9 +482,549 @@ def run_watch(a):
         print("\n감시 중지.")
 
 
+# ───────────────────────── 실시간 상황판(대시보드) ─────────────────────────
+# 대표님 요청: 슬랙 알림 대신, 침투 시도를 '실시간 화면'으로 보여준다.
+# 원칙 유지: 설치할 것 0개 — 파이썬 표준 http.server 와 순수 HTML/JS 만 쓴다.
+#   (1) 백그라운드 스레드가 scan_interval 초마다 로그를 다시 읽어 최신 경보를 갱신
+#   (2) 작은 웹서버가 화면(/)과 자료(/api/alerts·JSON)를 내려준다
+#   (3) 화면이 3초마다 /api/alerts 를 받아와 상황판을 다시 그린다
+
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") if dt else None
+
+
+def _is_suspicious(e):
+    """이 요청 한 건이 '수상한가' — 없는주소(404)·인증거부·탐침경로·도구 지문 중 하나라도."""
+    return (e["status"] == 404 or e["status"] in _AUTH_STATUSES
+            or is_probe_path(e["path"]) or is_tool(e["ua"]))
+
+
+def _event_kind(e):
+    """수상한 요청 한 건에 붙일 유형 이름(우선순위: 탐침 > 인증거부 > 없는주소 > 도구)."""
+    if is_probe_path(e["path"]):
+        return "탐침경로"
+    if e["status"] in _AUTH_STATUSES:
+        return "인증거부"
+    if e["status"] == 404:
+        return "없는 주소"
+    if is_tool(e["ua"]):
+        return "도구 접근"
+    return "요청"
+
+
+def _severity(kind):
+    """유형 → 심각도(위험/경고). 탐침·인증거부는 명백히 악의적 → 위험."""
+    return "위험" if kind in ("탐침경로", "인증거부") else "경고"
+
+
+def recommend(ip, path, status, ua, kind):
+    """규칙 기반 대응 추천 — 침투 유형을 보고 즉시 구체적 조치를 제시(오프라인·무료).
+
+    진짜 LLM 호출이 아니라 '보안 전문가의 대응 규칙'을 코드로 옮긴 것.
+    MES(Windows) 서버 기준의 방화벽 차단 명령까지 만들어 준다. 인터넷·API 키 불필요.
+    """
+    actions = []
+    if kind == "탐침경로":
+        headline = "민감·숨은 경로를 노린 스캐너(자동 정찰). 공개되면 안 될 주소를 찔러봄."
+        actions.append(f"이 경로({path})가 실제 서버에 존재·노출되는지 확인하고, 그렇다면 즉시 비공개로.")
+        actions.append("같은 IP가 여러 경로를 훑으면 스캐너로 보고 그 IP를 차단 대상에 올린다.")
+    elif kind == "인증거부":
+        headline = "로그인·권한 돌파 시도(무차별 대입 가능성). 반복되면 계정이 뚫릴 위험."
+        actions.append("대상 계정에 로그인 실패 잠금(예: 5회 실패 시 잠금)이 걸려 있는지 확인·강화.")
+        actions.append("같은 IP의 반복 실패면 IP 차단, 한 계정에 여러 IP면 그 계정 비밀번호 강제 변경.")
+        if status == 423:
+            actions.append("상태 423=이미 계정 잠금 발동 → 무차별 대입의 결정적 증거. 우선 대응.")
+    elif kind == "없는 주소":
+        headline = "없는 주소 훑기(정찰). 서버 구조를 떠보는 초기 단계일 수 있음."
+        actions.append("단발이면 소음일 수 있으나, 같은 IP가 반복하면 스캐너로 보고 관찰·차단.")
+    else:
+        headline = "자동화 도구의 접근."
+        actions.append("정상 트래픽인지 확인하고, 아니면 차단 대상에 올린다.")
+    if is_tool(ua):
+        actions.append("User-Agent 가 자동화 도구 지문(사람 아님) — 봇·스캐너 차단 정책 대상.")
+    # Windows(MES) 방화벽 차단 명령 — 관리자 권한에서 실행하면 이 IP 의 인바운드를 막는다
+    block_cmd = (f'netsh advfirewall firewall add rule '
+                 f'name="LogSentry-block-{ip}" dir=in action=block remoteip={ip}')
+    caution = ("운영 MES 서버에선 '즉시 차단'보다 먼저 '경고 모드'로 며칠 지켜보세요 — "
+               "정상 직원이 실수로 막히는 오탐을 피하기 위해. 확실한 공격 IP만 위 명령으로 차단.")
+    return {"headline": headline, "severity": _severity(kind),
+            "actions": actions, "block_cmd": block_cmd, "caution": caution}
+
+
+def _fmt_time(ts):
+    """datetime → 화면용 시각. 밀리초가 있으면 밀리초까지(없으면 초 단위)."""
+    if ts and ts.microsecond:
+        return ts.strftime("%H:%M:%S.") + f"{ts.microsecond // 1000:03d}"
+    if ts:
+        return ts.strftime("%H:%M:%S")
+    return "—"
+
+
+def _timeline_entry(time_disp, ts_iso, ip, path, method, status, ua, kind):
+    """타임라인 한 줄 + 상세·추천을 한 데 담는 공통 틀(로그에서 오든 DB에서 오든 같은 모양)."""
+    return {
+        "time": time_disp, "ts_iso": ts_iso or "", "ip": ip, "path": path,
+        "method": method or "GET", "status": status, "ua": ua or "",
+        "kind": kind, "severity": _severity(kind), "tool": is_tool(ua),
+        "rec": recommend(ip, path, status, ua, kind),
+    }
+
+
+def build_timeline(events, limit=60):
+    """[DB 미사용 시] 개별 공격 요청을 '시간 순(최근 먼저)'으로 — 누적 요약이 아니라 한 건 한 건.
+
+    신뢰 IP·정상 소음(_SKIP)은 뺀다. timestamp() 로 정렬해 aware/naive 혼용 오류를 피한다.
+    """
+    susp = [e for e in events
+            if e["ip"] not in _TRUSTED_IPS
+            and not any(e["path"].startswith(s) for s in _SKIP)
+            and _is_suspicious(e)]
+    susp.sort(key=lambda e: e["ts"].timestamp() if e["ts"] else float("-inf"), reverse=True)
+    out = []
+    for e in susp[:limit]:
+        iso = e["ts"].isoformat() if e["ts"] else ""
+        out.append(_timeline_entry(_fmt_time(e["ts"]), iso, e["ip"], e["path"],
+                                   e.get("method"), e["status"], e.get("ua"), _event_kind(e)))
+    return out
+
+
+# ───────────────────────── 침투 흔적 DB(SQLite, 파이썬 내장) ─────────────────────────
+# 대표님 요청: 침투 흔적을 '따로 DB에도' 남긴다. SQLite 는 파이썬에 기본 내장 → '설치 0' 원칙 유지.
+# 서버를 꺼도 흔적이 파일(logsentry.db)로 남아, 나중에 '언제 누가 몇 번' 조회·집계가 된다.
+
+def open_db(path):
+    """DB 파일을 열고(없으면 만들고) 침투 기록 표를 준비한다."""
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS intrusion("
+        "ts TEXT, ip TEXT, path TEXT, status INTEGER, method TEXT, ua TEXT,"
+        "kind TEXT, severity TEXT, seen_at TEXT,"
+        "UNIQUE(ts, ip, path, status))")   # 같은 요청 중복 저장 방지
+    conn.commit()
+    return conn
+
+
+def store_events(conn, events):
+    """수상한 요청만 DB 에 영구 저장(중복은 UNIQUE 로 자동 무시). 새로 저장된 건수를 돌려준다."""
+    now = datetime.now().isoformat(timespec="seconds")
+    saved = 0
+    for e in events:
+        if e["ip"] in _TRUSTED_IPS:
+            continue
+        if any(e["path"].startswith(s) for s in _SKIP):
+            continue
+        if not _is_suspicious(e):
+            continue
+        kind = _event_kind(e)
+        ts_iso = e["ts"].isoformat() if e["ts"] else ""
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO intrusion"
+            "(ts, ip, path, status, method, ua, kind, severity, seen_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (ts_iso, e["ip"], e["path"], e["status"], e.get("method") or "GET",
+             e.get("ua") or "", kind, _severity(kind), now))
+        saved += cur.rowcount
+    conn.commit()
+    return saved
+
+
+def recent_intrusions(conn, limit=60):
+    """DB 에서 최근 침투 흔적을 시간 순(최근 먼저)으로 꺼내 타임라인 모양으로."""
+    cur = conn.execute(
+        "SELECT ts, ip, path, status, method, ua, kind FROM intrusion"
+        " ORDER BY ts DESC LIMIT ?", (limit,))
+    out = []
+    for ts, ip, path, status, method, ua, kind in cur.fetchall():
+        try:
+            dt = datetime.fromisoformat(ts) if ts else None
+        except ValueError:
+            dt = None
+        out.append(_timeline_entry(_fmt_time(dt), ts, ip, path, method, status, ua, kind))
+    return out
+
+
+def print_db(path, limit):
+    """쌓인 침투 흔적 DB 를 표로 출력 — 상황판을 켜지 않고도 터미널에서 바로 조회."""
+    if not os.path.exists(path):
+        print(f"DB 파일이 없습니다: {path}\n(아직 저장된 침투 흔적이 없거나, 상황판을 한 번도 안 켰어요)")
+        return
+    conn = open_db(path)
+    total = conn.execute("SELECT COUNT(*) FROM intrusion").fetchone()[0]
+    rows = conn.execute(
+        "SELECT ts, ip, status, kind, severity, path FROM intrusion"
+        " ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+    print(f"\n📁 침투 흔적 DB: {path} — 총 {total}건 (최근 {len(rows)}건)\n")
+    print(f"{'시각':<20}  {'IP':<16}  상태  {'유형':<10}  {'심각도':<6}  경로")
+    print("-" * 96)
+    for ts, ip, status, kind, severity, pth in rows:
+        t = ts.replace("T", " ")[:19] if ts else "-"
+        print(f"{t:<20}  {ip:<16}  {status:<4}  {kind:<10}  {severity:<6}  {pth}")
+    agg = conn.execute(
+        "SELECT ip, COUNT(*) c FROM intrusion GROUP BY ip ORDER BY c DESC LIMIT 5").fetchall()
+    if agg:
+        print("\n공격 많은 IP(상위 5):")
+        for ip, c in agg:
+            print(f"  {ip:<16} {c}건")
+    conn.close()
+
+
+def build_dashboard_payload(results, dist, timeline=None):
+    """탐지 결과(dict) → 화면이 읽을 JSON-안전 자료. '자료/보여주기 분리' 원칙 그대로.
+
+    datetime 은 그대로는 JSON 이 못 되므로 문자열(_iso)로 바꾼다.
+    timeline(개별 공격 시간 순 목록)은 바깥에서 만들어(로그 또는 DB) 넘겨준다.
+    """
+    alerts = [r for r in results if r["level"] == "alert"]
+    watches = [r for r in results if r["level"] == "watch"]
+    rows = []
+    for r in results:
+        rows.append({
+            "ip": r["ip"], "score": r["score"], "level": r["level"],
+            "distinct_paths": r["distinct_paths"], "nf": r["nf"],
+            "auth": r["auth"], "probes": r["probes"], "tool": r["tool"],
+            "rate": r["rate"], "reasons": r["reasons"],
+            "first": _iso(r["first"]), "last": _iso(r["last"]),
+            "time": r["last"].strftime("%H:%M:%S") if r["last"] else "—",
+        })
+    return {
+        "generated": datetime.now().strftime("%H:%M:%S"),
+        "ip_count": len(results),                 # 공격 의심 IP 수
+        "alert_count": len(alerts),               # 위험(경보)
+        "watch_count": len(watches),              # 경고(관찰)
+        # '공격 요청(건)' = 악성으로 보이는 요청 수(없는주소 404 + 인증거부).
+        # 탐침경로는 대개 404 와 '같은 요청'이라 더하지 않는다 — 한 요청을 한 번만 센다.
+        "attempt_count": sum(r["nf"] + r["auth"] for r in results),
+        "alerts": rows,
+        "dist": dist,
+        "timeline": timeline or [],   # 개별 공격 시간 순(최근 먼저) — 바깥에서 만들어 넘김
+    }
+
+
+# 상황판 화면 — 순수 HTML/CSS/JS 한 장(외부 라이브러리 0). 자료는 /api/alerts 로 받아온다.
+_DASHBOARD_HTML = """<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LogSentry 실시간 침입 감시</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#0d1117; --panel:#161b22; --inset:#0d1117; --codebg:#010409;
+    --border:#222b36; --border2:#30363d; --rowline:#1c232c;
+    --text:#e6edf3; --muted:#8b949e; --faint:#6e7681;
+    --hover:#1c2330; --stripe:#12171e; --accent:#58a6ff; --mono:#adbac7;
+    --dist-bg:#1b1120; --dist-bd:#3d2340; --dist-fg:#e6b3ff;
+    --danger:#f85149; --warn:#d29922; --green:#2ea043;
+    --bdg-d-bg:#3d1518; --bdg-d-fg:#ff7b72; --bdg-w-bg:#3a2d10; --bdg-w-fg:#e3b341;
+    --disc-bg:#1b1813; --disc-bd:#3a2d10; --disc-fg:#e3b341;
+    --cmd-fg:#7ee787; --btn-bg:#21262d; --btn-fg:#c9d1d9; --overlay:rgba(0,0,0,.6);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg:#ffffff; --panel:#f6f8fa; --inset:#f6f8fa; --codebg:#f6f8fa;
+    --border:#d0d7de; --border2:#d0d7de; --rowline:#eaeef2;
+    --text:#1f2328; --muted:#656d76; --faint:#8c959f;
+    --hover:#eaf2ff; --stripe:#f6f8fa; --accent:#0969da; --mono:#424a53;
+    --dist-bg:#faf2ff; --dist-bd:#e5c8ff; --dist-fg:#8250df;
+    --danger:#cf222e; --warn:#9a6700; --green:#1a7f37;
+    --bdg-d-bg:#ffe3e1; --bdg-d-fg:#cf222e; --bdg-w-bg:#fff3cd; --bdg-w-fg:#7a5900;
+    --disc-bg:#fff8e6; --disc-bd:#f0d98c; --disc-fg:#7a5900;
+    --cmd-fg:#116329; --btn-bg:#eaeef2; --btn-fg:#24292f; --overlay:rgba(27,31,36,.35);
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family:"Segoe UI",system-ui,sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid var(--border);
+           display:flex; align-items:center; justify-content:space-between; }
+  header h1 { font-size:18px; margin:0; font-weight:600; }
+  .hr { display:flex; align-items:center; gap:14px; }
+  .tbtn { background:var(--btn-bg); color:var(--btn-fg); border:1px solid var(--border2);
+          border-radius:6px; padding:5px 11px; font-size:12px; cursor:pointer; }
+  .tbtn:hover { border-color:var(--accent); }
+  #status { font-size:12px; color:var(--muted); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+         background:var(--green); margin-right:6px; vertical-align:middle; }
+  .tiles { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; padding:20px; }
+  @media (max-width:640px){ .tiles{ grid-template-columns:repeat(2,1fr); } }
+  .tile { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  .tile .n { font-size:34px; font-weight:700; line-height:1; }
+  .tile .l { font-size:13px; color:var(--muted); margin-top:8px; }
+  .tile.danger .n { color:var(--danger); }
+  .tile.warn .n { color:var(--warn); }
+  #dist { padding:0 20px; }
+  #dist .d { background:var(--dist-bg); border:1px solid var(--dist-bd); color:var(--dist-fg);
+             border-radius:8px; padding:10px 12px; margin-bottom:10px; font-size:14px; }
+  .wrap { padding:8px 20px 28px; }
+  h2 { font-size:14px; color:var(--muted); font-weight:500; margin:12px 4px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th,td { text-align:left; padding:11px 12px; border-bottom:1px solid var(--rowline); }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  tbody tr:nth-child(even) td { background:var(--stripe); }      /* 줄무늬로 행 구분 */
+  tr.alert td:first-child { border-left:3px solid var(--danger); }
+  tr.watch td:first-child { border-left:3px solid var(--warn); }
+  .ip { font-family:ui-monospace,Consolas,monospace; }
+  .path { font-family:ui-monospace,Consolas,monospace; color:var(--mono); font-size:13px; word-break:break-all; }
+  td.st { color:var(--muted); }
+  .badge { padding:2px 10px; border-radius:20px; font-size:12px; font-weight:600;
+           white-space:nowrap; }
+  .badge.alert { background:var(--bdg-d-bg); color:var(--bdg-d-fg); }
+  .badge.watch { background:var(--bdg-w-bg); color:var(--bdg-w-fg); }
+  .empty { padding:44px; text-align:center; color:var(--faint); }
+  footer { padding:0 20px 24px; color:var(--faint); font-size:12px; }
+  tr.clk { cursor:pointer; }
+  tr.clk:hover td { background:var(--hover); }                   /* 마우스 올린 행 강조 */
+  /* 상세창(모달) */
+  #overlay { position:fixed; inset:0; background:var(--overlay); display:none;
+             align-items:flex-start; justify-content:center; padding:40px 16px; z-index:50; }
+  #overlay.on { display:flex; }
+  .modal { background:var(--panel); border:1px solid var(--border2); border-radius:12px;
+           max-width:640px; width:100%; max-height:85vh; overflow:auto; }
+  .modal .mh { padding:16px 20px; border-bottom:1px solid var(--border);
+               display:flex; align-items:center; justify-content:space-between; }
+  .modal .mh h3 { margin:0; font-size:16px; }
+  .modal .mx { cursor:pointer; color:var(--muted); font-size:20px; background:none; border:none; }
+  .modal .mb { padding:18px 20px; }
+  .kv { display:grid; grid-template-columns:96px 1fr; gap:8px 12px; font-size:14px; margin-bottom:16px; }
+  .kv .k { color:var(--muted); }
+  .kv .v { word-break:break-all; }
+  .rec { background:var(--inset); border:1px solid var(--border); border-radius:10px; padding:14px; }
+  .rec h4 { margin:0 0 8px; font-size:14px; color:var(--accent); }
+  .disc { background:var(--disc-bg); border:1px solid var(--disc-bd); color:var(--disc-fg);
+          border-radius:8px; padding:9px 11px; font-size:12.5px; line-height:1.55; margin-bottom:12px; }
+  .rec ul { margin:8px 0 0; padding-left:18px; }
+  .rec li { margin:6px 0; font-size:14px; line-height:1.5; }
+  .cmd { margin-top:12px; background:var(--codebg); border:1px solid var(--border2); border-radius:8px;
+         padding:10px 34px 10px 12px; font-family:ui-monospace,Consolas,monospace;
+         font-size:12.5px; color:var(--cmd-fg); word-break:break-all; position:relative; }
+  .cmd button { position:absolute; top:6px; right:6px; font-size:11px; background:var(--btn-bg);
+                color:var(--btn-fg); border:1px solid var(--border2); border-radius:6px; padding:2px 8px; cursor:pointer; }
+  .caution { margin-top:12px; font-size:13px; color:var(--warn); line-height:1.5; }
+  .sev { padding:2px 10px; border-radius:20px; font-size:12px; font-weight:600; }
+  .sev.danger { background:var(--bdg-d-bg); color:var(--bdg-d-fg); }
+  .sev.warn { background:var(--bdg-w-bg); color:var(--bdg-w-fg); }
+</style>
+</head>
+<body>
+  <header>
+    <h1>🛡️ LogSentry — 실시간 침입 감시</h1>
+    <div class="hr">
+      <button id="themeBtn" class="tbtn" onclick="toggleTheme()">☀ 밝게</button>
+      <span id="status"><span class="dot"></span>연결 중…</span>
+    </div>
+  </header>
+
+  <div class="tiles">
+    <div class="tile"><div class="n" id="attempt">0</div><div class="l">공격 요청(건)</div></div>
+    <div class="tile warn"><div class="n" id="warn">0</div><div class="l">경고</div></div>
+    <div class="tile danger"><div class="n" id="danger">0</div><div class="l">위험</div></div>
+    <div class="tile"><div class="n" id="ipc">0</div><div class="l">공격 의심 IP</div></div>
+  </div>
+
+  <div id="dist"></div>
+
+  <div class="wrap">
+    <h2>실시간 공격 타임라인 <span style="color:#6e7681;font-weight:400">· 최근 공격부터 · 줄을 클릭하면 상세·대응 추천</span></h2>
+    <table>
+      <thead><tr><th>시각</th><th>IP</th><th>노린 경로</th><th>유형</th><th>상태</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <footer>LogSentry · 읽기 전용(서버를 건드리지 않음) · 침투 흔적은 DB에 영구 저장 · 3초마다 자동 새로고침</footer>
+
+  <div id="overlay" onclick="if(event.target===this)closeDetail()">
+    <div class="modal">
+      <div class="mh"><h3 id="m-title">침투 상세</h3><button class="mx" onclick="closeDetail()">✕</button></div>
+      <div class="mb" id="m-body"></div>
+    </div>
+  </div>
+
+<script>
+function esc(s){ return String(s).replace(/[&<>"]/g,
+  function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+
+// 밝게/어둡게 테마 전환 — 고른 값을 브라우저에 기억(다음에 켜도 유지)
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  var b = document.getElementById('themeBtn');
+  if(b){ b.textContent = (t === 'light') ? '🌙 어둡게' : '☀ 밝게'; }
+  try { localStorage.setItem('ls-theme', t); } catch(e) {}
+}
+function toggleTheme(){
+  var cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  applyTheme(cur === 'light' ? 'dark' : 'light');
+}
+(function(){ try { var s = localStorage.getItem('ls-theme'); if(s){ applyTheme(s); } } catch(e) {} })();
+
+function setStatus(ok, t){
+  var el = document.getElementById('status');
+  el.innerHTML = ok
+    ? '<span class="dot"></span>연결됨 · 갱신 ' + esc(t)
+    : '<span class="dot" style="background:#f85149"></span>연결 끊김 — 재시도 중';
+}
+
+function render(d){
+  document.getElementById('attempt').textContent = d.attempt_count;
+  document.getElementById('warn').textContent    = d.watch_count;
+  document.getElementById('danger').textContent  = d.alert_count;
+  document.getElementById('ipc').textContent     = d.ip_count;
+
+  var dist = d.dist || [];
+  document.getElementById('dist').innerHTML = dist.map(function(x){
+    return '<div class="d">🌐 ' + esc(x.kind) + ' — 서로 다른 IP '
+         + x.ips + '개 (한 ' + x.window + '초 창)</div>';
+  }).join('');
+
+  var ev = d.timeline || [];
+  LAST = ev;                                     // 상세창에서 꺼내 쓰려고 보관
+  var tb = document.getElementById('rows');
+  if(!ev.length){
+    tb.innerHTML = '<tr><td colspan="5" class="empty">아직 탐지된 공격 요청이 없습니다 👍</td></tr>';
+    return;
+  }
+  tb.innerHTML = ev.map(function(e, i){
+    var cls = e.severity === '위험' ? 'alert' : 'watch';   // 위험=빨강, 경고=주황
+    var tool = e.tool ? ' <span class="badge watch">도구</span>' : '';
+    return '<tr class="clk ' + cls + '" onclick="openDetail(' + i + ')">'
+      + '<td class="ip">' + esc(e.time) + '</td>'
+      + '<td class="ip">' + esc(e.ip) + '</td>'
+      + '<td class="path">' + esc(e.path) + '</td>'
+      + '<td>' + esc(e.kind) + tool + '</td>'
+      + '<td class="st">' + e.status + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+var LAST = [];
+function openDetail(i){
+  var e = LAST[i]; if(!e) return;
+  var sc = e.severity === '위험' ? 'danger' : 'warn';
+  var rec = e.rec || {};
+  var acts = (rec.actions || []).map(function(a){ return '<li>' + esc(a) + '</li>'; }).join('');
+  document.getElementById('m-title').innerHTML =
+    '침투 상세 <span class="sev ' + sc + '">' + esc(e.severity) + '</span>';
+  document.getElementById('m-body').innerHTML =
+      '<div class="kv">'
+    +   '<div class="k">시각</div><div class="v ip">' + esc(e.ts_iso || e.time) + '</div>'
+    +   '<div class="k">공격자 IP</div><div class="v ip">' + esc(e.ip) + '</div>'
+    +   '<div class="k">노린 경로</div><div class="v path">' + esc(e.method) + ' ' + esc(e.path) + '</div>'
+    +   '<div class="k">상태코드</div><div class="v">' + e.status + '</div>'
+    +   '<div class="k">유형</div><div class="v">' + esc(e.kind) + '</div>'
+    +   '<div class="k">도구 지문</div><div class="v ip">' + esc(e.ua || '-') + '</div>'
+    +   '</div>'
+    + '<div class="rec">'
+    +   '<h4>🤖 대응 추천 (규칙 기반 · 참고용)</h4>'
+    +   '<div class="disc">※ 이 추천은 미리 정한 규칙에 따른 <b>참고용</b>이에요. '
+    +     '항상 맞는 건 아니며 <b>확정 판단이 아닙니다</b> — 실제 차단·조치 전에 '
+    +     '반드시 사람이 로그를 직접 확인하고, 운영 서버는 먼저 경고 모드로 지켜보세요.</div>'
+    +   '<div>' + esc(rec.headline || '') + '</div>'
+    +   '<ul>' + acts + '</ul>'
+    +   (rec.block_cmd ? '<div class="cmd"><button onclick="copyCmd(this)">복사</button>'
+          + esc(rec.block_cmd) + '</div>' : '')
+    +   (rec.caution ? '<div class="caution">⚠ ' + esc(rec.caution) + '</div>' : '')
+    + '</div>';
+  document.getElementById('overlay').classList.add('on');
+}
+function closeDetail(){ document.getElementById('overlay').classList.remove('on'); }
+function copyCmd(btn){
+  var txt = btn.parentNode.textContent.replace(/^복사(됨)?/, '').trim();
+  if(navigator.clipboard){ navigator.clipboard.writeText(txt); }
+  btn.textContent = '복사됨'; setTimeout(function(){ btn.textContent = '복사'; }, 1200);
+}
+document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closeDetail(); });
+
+function tick(){
+  fetch('/api/alerts', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){ render(d); setStatus(true, d.generated); })
+    .catch(function(){ setStatus(false); });
+}
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>"""
+
+
+def run_dashboard(a):
+    """[v2] 실시간 상황판 — 백그라운드로 로그를 재검사하고, 작은 웹서버로 화면·자료를 제공.
+
+    외부 라이브러리 0. 파이썬 표준 http.server 만 쓴다.
+    바인드 주소 기본값은 127.0.0.1(이 PC에서만 열람) — 사내망 공유는 --host 0.0.0.0.
+    """
+    state = {"payload": build_dashboard_payload([], [])}   # 공유 저장소
+    lock = threading.Lock()                                # 스레드 간 안전장치
+
+    if a.db:
+        print(f"침투 흔적 DB: {a.db} (영구 저장)")
+
+    def scanner():
+        """백그라운드: scan_interval 초마다 로그를 다시 읽어 최신 경보로 갱신.
+
+        DB 가 켜져 있으면 수상한 요청을 DB 에 쌓고(흔적 보존), 타임라인은 DB 에서 읽는다
+        → 상황판을 꺼도·로그가 지워져도 과거 침투가 남는다.
+        """
+        # SQLite 연결은 '이 스레드 안'에서 연다 — 연 스레드만 쓸 수 있는 규칙 때문.
+        conn = open_db(a.db) if a.db else None
+        while True:
+            try:
+                events, _ = load_events(a.logfile, a.format)
+                results = analyze(events, a.window, a.probe_threshold,
+                                  a.auth_threshold, a.rate_threshold, a.score_threshold)
+                dist = detect_distributed(events, a.window, a.dist_threshold)
+                if conn is not None:
+                    store_events(conn, events)               # 흔적을 DB 에 영구 저장
+                    timeline = recent_intrusions(conn, 60)   # 타임라인은 DB 에서(과거까지)
+                else:
+                    timeline = build_timeline(events, 60)     # DB 없으면 현재 로그에서
+                payload = build_dashboard_payload(results, dist, timeline)
+            except Exception as e:  # noqa: BLE001 — 한 번 실패해도 상황판은 멈추지 않는다
+                print(f"⚠ 재검사 실패(무시하고 계속): {e}")
+                payload = None
+            if payload is not None:
+                with lock:
+                    state["payload"] = payload
+            time.sleep(a.scan_interval)
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")   # 브라우저가 옛 화면 캐시 못하게
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):   # noqa: N802 (http.server 가 정한 이름)
+            if self.path.startswith("/api/alerts"):
+                with lock:
+                    body = json.dumps(state["payload"], ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+            elif self.path == "/" or self.path.startswith("/?"):
+                self._send(200, _DASHBOARD_HTML.encode("utf-8"),
+                           "text/html; charset=utf-8")
+            else:
+                self._send(404, b"not found", "text/plain; charset=utf-8")
+
+        def log_message(self, *args):   # 상황판 자신의 접근 로그는 콘솔에 찍지 않는다
+            pass
+
+    threading.Thread(target=scanner, daemon=True).start()   # 재검사 스레드 시작
+    srv = ThreadingHTTPServer((a.host, a.dashboard), Handler)
+    print(f"실시간 상황판 시작 — http://{a.host}:{a.dashboard}"
+          f"  ({a.scan_interval}초마다 재검사, Ctrl+C 로 중지)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n상황판 중지.")
+        srv.shutdown()
+
+
 def main():
     p = argparse.ArgumentParser(description="LogSentry — 접근 로그 침입 탐지")
-    p.add_argument("logfile", help="접근 로그 파일(nginx/apache/JSON)")
+    p.add_argument("logfile", nargs="?", help="접근 로그 파일(nginx/apache/JSON)")
     p.add_argument("--format", default="auto",
                    choices=["auto", "nginx", "apache", "json"],
                    help="로그 형식(기본 auto=자동 감지)")
@@ -490,7 +1042,23 @@ def main():
                    help="설정 파일(JSON) — 있으면 목록·문턱·신뢰IP·웹훅 을 덮어씀")
     p.add_argument("--watch", type=int, metavar="SECONDS",
                    help="N초마다 자동 재검사(새 경보만)")
+    p.add_argument("--dashboard", type=int, metavar="PORT",
+                   help="실시간 상황판(웹 화면)을 이 포트로 띄운다. 예: --dashboard 8787")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="상황판 바인드 주소(기본 127.0.0.1=이 PC에서만. 사내망 공유는 0.0.0.0)")
+    p.add_argument("--scan-interval", type=int, default=5,
+                   help="상황판이 로그를 다시 읽는 주기(초, 기본 5)")
+    p.add_argument("--db", default="logsentry.db",
+                   help="침투 흔적을 영구 저장할 SQLite DB 파일(기본 logsentry.db). 빈 값이면 끔")
+    p.add_argument("--show-db", type=int, nargs="?", const=30, metavar="N",
+                   help="쌓인 침투 흔적 DB 에서 최근 N건(기본 30)을 표로 보여주고 끝낸다")
     a = p.parse_args()
+
+    if a.show_db is not None:     # DB 조회만 하고 끝(상황판 안 켜도 됨)
+        print_db(a.db, a.show_db)
+        return
+    if not a.logfile:
+        p.error("접근 로그 파일을 지정하세요. (또는 --show-db 로 쌓인 DB 조회)")
 
     # 설정 파일을 읽어 목록·신뢰IP 를 덮어쓰고, 문턱은 명령줄 > 설정파일 > 기본값 순으로 정한다
     th = load_config(a.config)
@@ -508,6 +1076,10 @@ def main():
         a.dist_threshold = th["dist_ip"]
     if not a.webhook:           # 명령줄 > 설정파일 순으로 웹훅 주소를 정한다
         a.webhook = th["webhook"]
+
+    if a.dashboard:             # 실시간 상황판 모드(웹 화면)
+        run_dashboard(a)
+        return
 
     if a.watch:                 # 자동 감시 모드
         run_watch(a)
