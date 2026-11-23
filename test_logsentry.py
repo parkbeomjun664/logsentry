@@ -13,11 +13,13 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import logsentry
-from logsentry import (LoginTracker, _block_refusal, _is_private, _valid_ipv4,
-                       alert_key, analyze, analyze_logins, block_ip,
-                       build_dashboard_payload, build_timeline, detect_distributed,
-                       load_config, open_db, parse_line, recent_intrusions,
-                       recommend, send_webhook, store_events)
+from logsentry import (LoginTracker, _block_refusal, _is_private, _subnet24,
+                       _target_rule, _valid_ipv4, alert_key, analyze,
+                       analyze_logins, block_ip, build_dashboard_payload,
+                       build_timeline, detect_distributed, export_evidence,
+                       load_config, load_trusted, open_db, parse_line,
+                       recent_intrusions, recommend, send_webhook, store_events,
+                       trust_ip, unblock_ip, untrust_ip)
 
 # 기본 문턱(main 의 기본값과 같게)
 DEFAULTS = dict(window=60, probe_threshold=5, auth_threshold=5,
@@ -427,6 +429,84 @@ class TestBlocking(unittest.TestCase):
             self.assertEqual(rows[0][2], "refused")
         finally:
             os.remove(path)
+
+
+class TestActions(unittest.TestCase):
+    """[v3.1] 임시/대역 차단·증거 저장·되돌리기 — 조치 확장. 실제 방화벽은 안 건드리는 선에서."""
+
+    def _probe_events(self):
+        lines = [nginx("203.0.113.77", f"09:00:0{i}", "GET", p, 404, "python-requests/2.31")
+                 for i, p in enumerate(PROBES)]
+        return [e for e in (parse_line(l) for l in lines) if e]
+
+    def test_subnet_target_and_rule(self):
+        """/24 대역 대상·규칙이름·표시키 계산."""
+        self.assertEqual(_subnet24("203.0.113.77"), "203.0.113.0/24")
+        net, rule, key = _target_rule("203.0.113.77", "subnet")
+        self.assertEqual(net, "203.0.113.0/24")
+        self.assertEqual(key, "203.0.113.0/24")
+        self.assertIn("203-0-113-0_24", rule)
+
+    def test_subnet_block_still_refuses_self(self):
+        """대역 차단이라도 자기자신(127.x)은 거부 — 안전장치는 scope 무관."""
+        self.assertEqual(block_ip("", "127.0.0.1", scope="subnet")["status"], "refused")
+
+    def test_unblock_key_forms(self):
+        """해제는 단일 IP 키와 '/24' 대역 키를 모두 받아 예외 없이 처리한다."""
+        self.assertEqual(unblock_ip("", "bad")["status"], "refused")   # 형식오류 거부
+        r = unblock_ip("", "203.0.113.0/24")                           # 대역 키도 dict 반환
+        self.assertEqual(r.get("key"), "203.0.113.0/24")
+
+    def test_evidence_export(self):
+        """증거 저장 — 그 IP 기록을 파일로, 건수·내용 확인. 기록 없는 IP 는 거부."""
+        ev = self._probe_events()
+        fd, dbp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        conn = open_db(dbp)
+        store_events(conn, ev)
+        conn.close()
+        res = export_evidence(dbp, "203.0.113.77")
+        try:
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["count"], len(PROBES))
+            self.assertTrue(os.path.exists(res["path"]))
+            with open(res["path"], encoding="utf-8") as fh:
+                self.assertIn("203.0.113.77", fh.read())
+            self.assertFalse(export_evidence(dbp, "198.51.100.9")["ok"])   # 기록 없음
+        finally:
+            if res.get("path") and os.path.exists(res["path"]):
+                os.remove(res["path"])
+            os.remove(dbp)
+
+
+class TestTrustAndPanels(unittest.TestCase):
+    """[v3.2] 신뢰 IP(오탐 처리) · Top 패널 — 피어 도구에서 적용한 개선."""
+
+    def test_trust_roundtrip(self):
+        """신뢰 추가→목록에 있음→해제→사라짐. 형식오류는 거부."""
+        fd, dbp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            self.assertFalse(trust_ip(dbp, "bad")["ok"])             # 형식오류 거부
+            self.assertTrue(trust_ip(dbp, "203.0.113.77")["ok"])
+            self.assertIn("203.0.113.77", load_trusted(dbp))
+            self.assertTrue(untrust_ip(dbp, "203.0.113.77")["ok"])
+            self.assertNotIn("203.0.113.77", load_trusted(dbp))
+        finally:
+            os.remove(dbp)
+
+    def test_top_panels_in_payload(self):
+        """payload 에 Top 공격IP·Top 경로가 횟수 내림차순으로 담긴다."""
+        lines = [nginx("203.0.113.77", f"09:00:0{i}", "GET", p, 404, "sqlmap")
+                 for i, p in enumerate(PROBES)]
+        events = [e for e in (parse_line(l) for l in lines) if e]
+        results = analyze(events, **DEFAULTS)
+        p = build_dashboard_payload(results, [], build_timeline(events, 60))
+        self.assertTrue(p["top_ips"])
+        self.assertEqual(p["top_ips"][0]["ip"], "203.0.113.77")
+        self.assertTrue(p["top_paths"])
+        counts = [x["count"] for x in p["top_paths"]]
+        self.assertEqual(counts, sorted(counts, reverse=True))       # 내림차순
 
 
 if __name__ == "__main__":

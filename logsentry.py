@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 import urllib.request
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -611,6 +611,10 @@ def open_db(path):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS block_audit("
         "ts TEXT, ip TEXT, action TEXT, result TEXT, detail TEXT)")
+    # 신뢰 IP(오탐 처리) — 여기 든 IP 는 공격으로 세지도 보여주지도 않는다
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS trusted("
+        "ip TEXT PRIMARY KEY, added_at TEXT)")
     conn.commit()
     return conn
 
@@ -692,6 +696,21 @@ def _rule_name(ip):
     return f"LogSentry-block-{ip}"
 
 
+def _subnet24(ip):
+    """IP → 그 /24 대역 문자열(예: 203.0.113.77 → 203.0.113.0/24)."""
+    a, b, c, _ = ip.split(".")
+    return f"{a}.{b}.{c}.0/24"
+
+
+def _target_rule(ip, scope):
+    """차단 대상·규칙이름·표시키를 scope(ip|subnet)에 맞게 돌려준다."""
+    if scope == "subnet":
+        net = _subnet24(ip)                       # 203.0.113.0/24
+        base = net.split("/")[0].replace(".", "-")
+        return net, f"LogSentry-block-{base}_24", net
+    return ip, _rule_name(ip), ip
+
+
 def _run_netsh(args):
     """netsh 를 '셸 없이' 실행(리스트 인자 → 명령어 주입 불가). (종료코드, 메시지) 반환."""
     if os.name != "nt":
@@ -722,15 +741,20 @@ def _audit(db_path, ip, action, result, detail):
         pass
 
 
-def block_ip(db_path, ip, reason=""):
-    """IP 를 실제로 차단(Windows 방화벽 inbound 규칙 추가). 결과 dict 반환."""
-    refuse = _block_refusal(ip)
+def block_ip(db_path, ip, reason="", scope="ip"):
+    """IP(또는 /24 대역)를 실제로 차단(Windows 방화벽 inbound 규칙 추가). 결과 dict 반환.
+
+    scope="subnet" 이면 그 IP 의 /24 대역 전체를 막는다(공격자가 IP 를 바꿔가며 올 때).
+    표시키(key)=실제 막은 대상(IP 또는 'a.b.c.0/24') — 되돌릴 때 이 키를 쓴다.
+    """
+    refuse = _block_refusal(ip)                   # 대상 IP 로 자기자신·형식 검증(대역도 동일)
     if refuse:
         _audit(db_path, ip, "block", "refused", refuse)
         return {"ok": False, "ip": ip, "status": "refused", "message": refuse}
+    target, rule, key = _target_rule(ip, scope)
     rc, msg = _run_netsh(["advfirewall", "firewall", "add", "rule",
-                          f"name={_rule_name(ip)}", "dir=in", "action=block",
-                          f"remoteip={ip}"])
+                          f"name={rule}", "dir=in", "action=block",
+                          f"remoteip={target}"])
     if rc == 0:
         if db_path:
             try:
@@ -738,42 +762,84 @@ def block_ip(db_path, ip, reason=""):
                 conn.execute(
                     "INSERT OR REPLACE INTO blocklist(ip, reason, blocked_at, rule_name, active)"
                     " VALUES(?,?,?,?,1)",
-                    (ip, reason, datetime.now().isoformat(timespec="seconds"), _rule_name(ip)))
+                    (key, reason, datetime.now().isoformat(timespec="seconds"), rule))
                 conn.commit()
                 conn.close()
             except Exception:  # noqa: BLE001
                 pass
-        _audit(db_path, ip, "block", "ok", msg)
-        return {"ok": True, "ip": ip, "status": "blocked", "private": _is_private(ip),
-                "message": f"차단 완료 — {ip} 의 들어오는 연결을 방화벽에서 막았습니다."
+        _audit(db_path, key, "block", "ok", msg)
+        what = f"대역 {key} 전체(약 254개 IP)" if scope == "subnet" else f"{key} 의 들어오는 연결"
+        return {"ok": True, "ip": ip, "key": key, "status": "blocked", "private": _is_private(ip),
+                "message": f"차단 완료 — {what}을 방화벽에서 막았습니다."
                            + ("  ⚠ 사설 IP라 사내 직원일 수 있으니 확인하세요." if _is_private(ip) else "")}
     low = msg.lower()
     if any(k in msg for k in ("권한", "액세스", "관리자")) or any(k in low for k in ("elevat", "administrator", "denied", "requires")):
         hint = "실제 차단 실패 — 상황판을 '관리자 권한'으로 실행해야 방화벽을 바꿀 수 있습니다."
     else:
         hint = "방화벽 명령 실행에 실패했습니다."
-    _audit(db_path, ip, "block", "failed", msg)
-    return {"ok": False, "ip": ip, "status": "failed", "message": hint, "detail": msg[:200]}
+    _audit(db_path, key, "block", "failed", msg)
+    return {"ok": False, "ip": ip, "key": key, "status": "failed", "message": hint, "detail": msg[:200]}
 
 
-def unblock_ip(db_path, ip):
-    """차단했던 IP 를 되돌린다(방화벽 규칙 삭제)."""
-    if not _valid_ipv4(ip):
-        return {"ok": False, "ip": ip, "status": "refused", "message": "IP 형식이 올바르지 않습니다."}
-    rc, msg = _run_netsh(["advfirewall", "firewall", "delete", "rule", f"name={_rule_name(ip)}"])
+def unblock_ip(db_path, key):
+    """차단했던 대상을 되돌린다(방화벽 규칙 삭제). key=IP 또는 'a.b.c.0/24'."""
+    if "/" in key:                                 # 대역 해제
+        base = key.split("/")[0]
+        if not _valid_ipv4(base):
+            return {"ok": False, "ip": key, "status": "refused", "message": "대역 형식이 올바르지 않습니다."}
+        a, b, c, _ = base.split(".")
+        rule = f"LogSentry-block-{a}-{b}-{c}-0_24"
+    elif _valid_ipv4(key):                          # 단일 IP 해제
+        rule = _rule_name(key)
+    else:
+        return {"ok": False, "ip": key, "status": "refused", "message": "IP 형식이 올바르지 않습니다."}
+    rc, msg = _run_netsh(["advfirewall", "firewall", "delete", "rule", f"name={rule}"])
     ok = rc == 0
     if db_path:
         try:
             conn = open_db(db_path)
-            conn.execute("UPDATE blocklist SET active=0 WHERE ip=?", (ip,))
+            conn.execute("UPDATE blocklist SET active=0 WHERE ip=?", (key,))
             conn.commit()
             conn.close()
         except Exception:  # noqa: BLE001
             pass
-    _audit(db_path, ip, "unblock", "ok" if ok else "failed", msg)
-    return {"ok": ok, "ip": ip, "status": "unblocked" if ok else "failed",
+    _audit(db_path, key, "unblock", "ok" if ok else "failed", msg)
+    return {"ok": ok, "ip": key, "key": key, "status": "unblocked" if ok else "failed",
             "message": "차단 해제 완료 — 다시 연결을 허용합니다." if ok
                        else "해제 실패(관리자 권한이 필요할 수 있습니다)."}
+
+
+def export_evidence(db_path, ip):
+    """그 IP 의 침투 기록을 텍스트 파일로 내보낸다(보고·신고용 증거). 결과 dict 반환."""
+    if not _valid_ipv4(ip):
+        return {"ok": False, "message": "IP 형식이 올바르지 않습니다."}
+    if not db_path or not os.path.exists(db_path):
+        return {"ok": False, "message": "저장된 기록(DB)이 없어 내보낼 수 없습니다."}
+    try:
+        conn = open_db(db_path)
+        rows = conn.execute(
+            "SELECT ts, path, status, method, ua, kind, severity FROM intrusion"
+            " WHERE ip=? ORDER BY ts", (ip,)).fetchall()
+        conn.close()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "message": f"DB 읽기 실패: {e}"}
+    if not rows:
+        return {"ok": False, "message": f"{ip} 관련 기록이 없습니다."}
+    outdir = os.path.dirname(os.path.abspath(db_path)) or "."
+    fname = f"evidence_{ip.replace('.', '-')}_{datetime.now():%Y%m%d_%H%M%S}.txt"
+    path = os.path.join(outdir, fname)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# LogSentry 증거 — 공격자 {ip}\n")
+            f.write(f"# 생성 {datetime.now().isoformat(timespec='seconds')} · 총 {len(rows)}건\n")
+            f.write("# 시각\t심각도\t유형\t상태\t요청\t도구지문\n\n")
+            for ts, pth, status, method, ua, kind, sev in rows:
+                f.write(f"{ts}\t{sev}\t{kind}\t{status}\t{method} {pth}\t{ua}\n")
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "message": f"파일 저장 실패: {e}"}
+    _audit(db_path, ip, "evidence", "ok", path)
+    return {"ok": True, "count": len(rows), "path": path,
+            "message": f"{ip} 관련 {len(rows)}건을 저장했습니다:\n{path}"}
 
 
 def load_blocked(db_path):
@@ -783,6 +849,50 @@ def load_blocked(db_path):
     try:
         conn = open_db(db_path)
         rows = conn.execute("SELECT ip FROM blocklist WHERE active=1").fetchall()
+        conn.close()
+        return {r[0] for r in rows}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def trust_ip(db_path, ip):
+    """IP 를 신뢰 목록에 넣는다(오탐 처리) — 이후 공격으로 세지도 보여주지도 않는다."""
+    if not _valid_ipv4(ip):
+        return {"ok": False, "ip": ip, "message": "IP 형식이 올바르지 않습니다."}
+    if db_path:
+        try:
+            conn = open_db(db_path)
+            conn.execute("INSERT OR REPLACE INTO trusted(ip, added_at) VALUES(?,?)",
+                         (ip, datetime.now().isoformat(timespec="seconds")))
+            conn.commit()
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _audit(db_path, ip, "trust", "ok", "신뢰 IP 추가(오탐 처리)")
+    return {"ok": True, "ip": ip, "message": f"{ip} 를 신뢰 IP로 표시했습니다 — 더는 공격으로 보이지 않습니다."}
+
+
+def untrust_ip(db_path, ip):
+    """신뢰 목록에서 뺀다(되돌리기) — 다시 탐지 대상이 된다."""
+    if db_path:
+        try:
+            conn = open_db(db_path)
+            conn.execute("DELETE FROM trusted WHERE ip=?", (ip,))
+            conn.commit()
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _audit(db_path, ip, "untrust", "ok", "신뢰 IP 해제")
+    return {"ok": True, "ip": ip, "message": f"{ip} 신뢰를 해제했습니다 — 다시 탐지합니다."}
+
+
+def load_trusted(db_path):
+    """현재 신뢰(오탐 처리) IP 집합."""
+    if not db_path or not os.path.exists(db_path):
+        return set()
+    try:
+        conn = open_db(db_path)
+        rows = conn.execute("SELECT ip FROM trusted").fetchall()
         conn.close()
         return {r[0] for r in rows}
     except Exception:  # noqa: BLE001
@@ -832,6 +942,13 @@ def build_dashboard_payload(results, dist, timeline=None):
             "first": _iso(r["first"]), "last": _iso(r["last"]),
             "time": r["last"].strftime("%H:%M:%S") if r["last"] else "—",
         })
+    # Top 패널 (GoAccess 식) — 한눈에 '누가·어디를' 가장 많이 노렸는지.
+    top_ips = sorted(
+        ({"ip": r["ip"], "count": r["nf"] + r["auth"] + r["probes"],
+          "level": r["level"], "score": r["score"]} for r in rows),
+        key=lambda x: (x["count"], x["score"]), reverse=True)[:6]
+    top_paths = [{"path": p, "count": c}
+                 for p, c in Counter(t["path"] for t in (timeline or [])).most_common(6)]
     return {
         "generated": datetime.now().strftime("%H:%M:%S"),
         "ip_count": len(results),                 # 공격 의심 IP 수
@@ -843,6 +960,8 @@ def build_dashboard_payload(results, dist, timeline=None):
         "alerts": rows,
         "dist": dist,
         "timeline": timeline or [],   # 개별 공격 시간 순(최근 먼저) — 바깥에서 만들어 넘김
+        "top_ips": top_ips,           # 가장 많이 공격한 IP (Top 6)
+        "top_paths": top_paths,       # 가장 많이 노린 경로 (Top 6)
     }
 
 
@@ -973,14 +1092,68 @@ _DASHBOARD_HTML = """<!doctype html>
   .actbtn { border:none; border-radius:8px; padding:9px 16px; font-size:13.5px; font-weight:600; cursor:pointer; }
   .actbtn.block { background:var(--danger); color:#fff; }
   .actbtn.unblock { background:var(--green); color:#fff; }
+  .actbtn.temp { background:var(--warn); color:#fff; }
+  .actbtn.subnet { background:#8957e5; color:#fff; }
+  .actbtn.evic { background:var(--btn-bg); color:var(--btn-fg); border:1px solid var(--border2); }
+  .actbtn.trust { background:#1f6feb; color:#fff; }
   .actbtn:hover { opacity:.9; }
-  .ahint { font-size:11.5px; color:var(--faint); line-height:1.45; max-width:340px; }
+  .ahint { font-size:11.5px; color:var(--faint); line-height:1.45; width:100%; margin-top:4px; }
+  /* 한 번 더 묻는 확인창 */
+  #confirm { position:fixed; inset:0; background:var(--overlay); display:none;
+             align-items:center; justify-content:center; padding:24px; z-index:60; }
+  #confirm.on { display:flex; }
+  .cfbox { background:var(--panel); border:1px solid var(--border2); border-radius:12px;
+           max-width:440px; width:100%; overflow:hidden; }
+  .cfh { padding:15px 20px; font-size:16px; font-weight:600; border-bottom:1px solid var(--border); }
+  .cfb { padding:16px 20px; font-size:14px; line-height:1.6; }
+  .cfb p { margin:0 0 8px; }
+  .cfb .cf-warn { color:var(--danger); font-weight:600; margin-top:10px; }
+  .cff { display:flex; justify-content:flex-end; gap:10px; padding:14px 20px; border-top:1px solid var(--border); }
+  .cfbtn { border:none; border-radius:8px; padding:9px 18px; font-size:13.5px; font-weight:600; cursor:pointer; }
+  .cfbtn.ghost { background:var(--btn-bg); color:var(--btn-fg); border:1px solid var(--border2); }
+  .cfbtn.danger { background:var(--danger); color:#fff; }
+  .cfbtn.go { background:var(--green); color:#fff; }
+  /* 되돌리기(실행 취소) 토스트 */
+  #toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+           background:var(--panel); color:var(--text); border:1px solid var(--border2);
+           border-radius:10px; padding:11px 14px; font-size:13.5px; display:none;
+           align-items:center; gap:14px; box-shadow:0 6px 24px rgba(0,0,0,.35); z-index:70; max-width:92vw; }
+  #toast.on { display:flex; }
+  #toast span { word-break:break-all; }
+  #toast button { background:var(--accent); color:#fff; border:none; border-radius:7px;
+                  padding:5px 12px; font-size:12.5px; font-weight:600; cursor:pointer; white-space:nowrap; }
+  /* Top 패널 (가장 많이 공격한 IP·경로) */
+  .toppanels { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:4px 20px 0; }
+  @media (max-width:640px){ .toppanels{ grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+  .panel h3 { margin:0 0 10px; font-size:13px; color:var(--muted); font-weight:600; }
+  .prow { position:relative; display:flex; justify-content:space-between; align-items:center;
+          gap:10px; padding:6px 8px; border-radius:6px; cursor:pointer; font-size:13px; overflow:hidden; }
+  .prow:hover { background:var(--hover); }
+  .prow .bar { position:absolute; left:0; top:0; bottom:0; background:var(--stripe); z-index:0; }
+  .prow.alert .bar { background:var(--bdg-d-bg); }
+  .prow .lbl { position:relative; z-index:1; font-family:ui-monospace,Consolas,monospace;
+               white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .prow .cnt { position:relative; z-index:1; color:var(--muted); font-weight:600; flex:none; }
+  .panel .pempty { color:var(--faint); font-size:12.5px; padding:6px 8px; }
+  /* 툴바(종류별 탭 + 검색) */
+  .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; }
+  .search { flex:1; min-width:180px; max-width:280px; background:var(--inset); color:var(--text);
+            border:1px solid var(--border2); border-radius:8px; padding:7px 11px; font-size:13px; }
+  .search:focus { outline:none; border-color:var(--accent); }
+  /* 신뢰(오탐) IP 띠 — 차단 띠의 초록 버전 */
+  #trusted { padding:0 20px; }
+  .tstrip { background:var(--bdg-w-bg); border:1px solid var(--green); border-radius:8px;
+            padding:9px 12px; margin-bottom:10px; font-size:13px;
+            display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .tlab { color:var(--green); font-weight:600; }
 </style>
 </head>
 <body>
   <header>
     <h1>🛡️ LogSentry — 실시간 침입 감시</h1>
     <div class="hr">
+      <button id="pauseBtn" class="tbtn" onclick="togglePause()">⏸ 일시정지</button>
       <button id="themeBtn" class="tbtn" onclick="toggleTheme()">☀ 밝게</button>
       <span id="status"><span class="dot"></span>연결 중…</span>
     </div>
@@ -993,12 +1166,18 @@ _DASHBOARD_HTML = """<!doctype html>
     <div class="tile"><div class="n" id="ipc">0</div><div class="l">공격 의심 IP</div></div>
   </div>
 
+  <div id="toppanels" class="toppanels"></div>
   <div id="dist"></div>
   <div id="blocked"></div>
+  <div id="trusted"></div>
 
   <div class="wrap">
-    <h2>종류별로 보기 <span style="color:#6e7681;font-weight:400">· 탭을 누르면 그 유형만 추립니다</span></h2>
-    <div id="filters" class="filters"></div>
+    <h2>종류별로 보기 <span style="color:#6e7681;font-weight:400">· 탭을 누르면 그 유형만, 검색창으로 더 좁히기</span></h2>
+    <div class="toolbar">
+      <div id="filters" class="filters"></div>
+      <input id="search" class="search" type="search" oninput="onSearch(this.value)"
+             placeholder="🔎 IP·경로·도구 검색…">
+    </div>
     <h2>실시간 공격 타임라인 <span style="color:#6e7681;font-weight:400">· 최근 공격부터 · 줄을 클릭하면 상세·대응·차단</span></h2>
     <table>
       <thead><tr><th>시각</th><th>IP</th><th>노린 경로</th><th>유형</th><th>상태</th></tr></thead>
@@ -1014,6 +1193,21 @@ _DASHBOARD_HTML = """<!doctype html>
       <div class="mb" id="m-body"></div>
     </div>
   </div>
+
+  <!-- 한 번 더 묻는 확인창 -->
+  <div id="confirm">
+    <div class="cfbox">
+      <div class="cfh" id="cf-title">확인</div>
+      <div class="cfb" id="cf-body"></div>
+      <div class="cff">
+        <button class="cfbtn ghost" id="cf-cancel">취소</button>
+        <button class="cfbtn danger" id="cf-ok">확인</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 되돌리기(실행 취소) 토스트 -->
+  <div id="toast"></div>
 
 <script>
 function esc(s){ return String(s).replace(/[&<>"]/g,
@@ -1041,8 +1235,11 @@ function setStatus(ok, t){
 
 var LAST = [];          // 최근 타임라인(상세창·필터에서 꺼내 씀)
 var BLOCKED = [];       // 현재 차단 중인 IP 목록
+var TRUSTED = [];       // 신뢰(오탐 처리) IP 목록
 var FILTER = '전체';    // 지금 고른 종류별 필터
 var KINDS = [];         // 탭에 뜬 종류 순서
+var SEARCH = '';        // 검색어(IP·경로·도구)
+var PAUSED = false;     // 자동 새로고침 일시정지
 
 function render(d){
   document.getElementById('attempt').textContent = d.attempt_count;
@@ -1058,9 +1255,49 @@ function render(d){
 
   LAST = d.timeline || [];
   BLOCKED = d.blocked || [];
+  TRUSTED = d.trusted || [];
+  renderTop(d);
   renderBlocked();
+  renderTrusted();
   renderFilters();
   renderRows();
+}
+
+// Top 패널 — 가장 많이 공격한 IP·경로(막대 길이=횟수). 클릭하면 그 값으로 검색.
+function renderTop(d){
+  var ips = d.top_ips || [], paths = d.top_paths || [];
+  var maxI = ips.length ? ips[0].count : 1;
+  var maxP = paths.length ? paths[0].count : 1;
+  var ipRows = ips.length ? ips.map(function(x){
+    var w = Math.max(6, Math.round(x.count / maxI * 100));
+    return '<div class="prow ' + (x.level === 'alert' ? 'alert' : '') + '" title="클릭=이 IP로 검색" '
+      + 'onclick="onSearch(&#39;' + esc(x.ip) + '&#39;, true)">'
+      + '<span class="bar" style="width:' + w + '%"></span>'
+      + '<span class="lbl">' + esc(x.ip) + '</span><span class="cnt">' + x.count + '</span></div>';
+  }).join('') : '<div class="pempty">아직 없음 👍</div>';
+  var pathRows = paths.length ? paths.map(function(x){
+    var w = Math.max(6, Math.round(x.count / maxP * 100));
+    return '<div class="prow" title="클릭=이 경로로 검색" '
+      + 'onclick="onSearch(&#39;' + esc(x.path) + '&#39;, true)">'
+      + '<span class="bar" style="width:' + w + '%"></span>'
+      + '<span class="lbl">' + esc(x.path) + '</span><span class="cnt">' + x.count + '</span></div>';
+  }).join('') : '<div class="pempty">아직 없음 👍</div>';
+  document.getElementById('toppanels').innerHTML =
+      '<div class="panel"><h3>🎯 가장 많이 공격한 IP</h3>' + ipRows + '</div>'
+    + '<div class="panel"><h3>📂 가장 많이 노린 경로</h3>' + pathRows + '</div>';
+}
+
+// 신뢰(오탐) IP 띠 — 각 IP 옆에 '다시 탐지'(되돌리기) 버튼
+function renderTrusted(){
+  var el = document.getElementById('trusted');
+  if(!TRUSTED.length){ el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="tstrip"><span class="tlab">✅ 신뢰 IP · 오탐 처리 ('
+    + TRUSTED.length + ')</span>'
+    + TRUSTED.map(function(ip){
+        return '<span class="bchip">' + esc(ip)
+          + '<button onclick="untrustIp(&#39;' + esc(ip) + '&#39;)">다시 탐지</button></span>';
+      }).join('')
+    + '</div>';
 }
 
 // 차단된 IP 띠 — 각 IP 옆에 '해제'(되돌리기) 버튼
@@ -1095,12 +1332,25 @@ function renderFilters(){
 }
 function setFilter(idx){ FILTER = (idx < 0) ? '전체' : KINDS[idx]; renderFilters(); renderRows(); }
 
-// 타임라인 표 — FILTER 로 추려 그린다(원래 인덱스를 유지해 상세창이 정확히 열림)
+// 검색창 입력(또는 Top 패널 클릭). focus=true면 검색창에 값을 채워 맞춰 준다.
+function onSearch(v, focus){
+  SEARCH = (v || '').toLowerCase().trim();
+  if(focus){ var s = document.getElementById('search'); if(s){ s.value = v; } }
+  renderRows();
+}
+function matchSearch(e){
+  if(!SEARCH){ return true; }
+  return (e.ip + ' ' + e.path + ' ' + (e.ua || '') + ' ' + e.kind).toLowerCase().indexOf(SEARCH) >= 0;
+}
+
+// 타임라인 표 — FILTER + 검색어로 추려 그린다(원래 인덱스를 유지해 상세창이 정확히 열림)
 function renderRows(){
-  var out = [];
+  var out = [], shown = 0;
   for(var i = 0; i < LAST.length; i++){
     var e = LAST[i];
     if(FILTER !== '전체' && e.kind !== FILTER){ continue; }
+    if(!matchSearch(e)){ continue; }
+    shown++;
     var cls = e.severity === '위험' ? 'alert' : 'watch';   // 위험=빨강, 경고=주황
     var tool = e.tool ? ' <span class="badge watch">도구</span>' : '';
     var blk = (BLOCKED.indexOf(e.ip) >= 0) ? ' <span class="badge blk">차단됨</span>' : '';
@@ -1113,38 +1363,155 @@ function renderRows(){
       + '</tr>');
   }
   document.getElementById('rows').innerHTML = out.length ? out.join('')
-    : '<tr><td colspan="5" class="empty">해당 종류의 공격 기록이 없습니다 👍</td></tr>';
+    : '<tr><td colspan="5" class="empty">' + (SEARCH ? '검색 결과가 없습니다' : '해당 종류의 공격 기록이 없습니다 👍') + '</td></tr>';
 }
 
-// 실제 차단/해제 — 확인창 후 서버에 요청(서버가 자기자신·사설IP·권한을 최종 판단)
-function blockIp(ip){
-  if(!confirm('정말 ' + ip + ' 를 차단할까요?\\n\\n'
-    + '· 윈도우 방화벽에서 이 IP의 "들어오는 연결"을 막습니다\\n'
-    + '· 실제 차단은 관리자 권한이 필요합니다\\n'
-    + '· 자기자신(127.x)·사설 IP는 거부되거나 경고됩니다\\n'
-    + '· 언제든 "해제"로 되돌릴 수 있습니다')){ return; }
-  fetch('/api/block', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ip: ip})})
+// ── 조치 공통 도구: 서버 요청 / 한 번 더 묻는 확인창 / 되돌리기 토스트 ──
+function postJSON(url, obj){
+  return fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                     body: JSON.stringify(obj)})
     .then(function(r){ return r.json(); })
-    .then(function(res){
-      alert((res.ok ? '✅ ' : '⚠ ') + (res.message || '')
-        + (res.detail ? ('\\n\\n상세: ' + res.detail) : ''));
-      closeDetail(); tick();
-    })
-    .catch(function(){ alert('요청 실패 — 서버 연결을 확인하세요.'); });
+    .catch(function(){ return {ok:false, message:'요청 실패 — 서버 연결을 확인하세요.'}; });
 }
-function unblockIp(ip){
-  if(!confirm(ip + ' 차단을 해제할까요? (다시 연결을 허용합니다)')){ return; }
-  fetch('/api/unblock', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ip: ip})})
-    .then(function(r){ return r.json(); })
-    .then(function(res){ alert((res.ok ? '✅ ' : '⚠ ') + (res.message || '')); closeDetail(); tick(); })
-    .catch(function(){ alert('요청 실패 — 서버 연결을 확인하세요.'); });
+function subnet24(ip){ var p = ip.split('.'); return p[0]+'.'+p[1]+'.'+p[2]+'.0/24'; }
+
+// 한 번 더 묻는 확인창(심각한 건 twoStep=첫 클릭은 '한 번 더'). 약속(Promise)으로 true/false 반환.
+function askConfirm(opts){
+  return new Promise(function(resolve){
+    var ov = document.getElementById('confirm');
+    var btn = document.getElementById('cf-ok');
+    var cancel = document.getElementById('cf-cancel');
+    document.getElementById('cf-title').textContent = opts.title || '확인';
+    document.getElementById('cf-body').innerHTML =
+      (opts.lines || []).map(function(l){ return '<p>' + esc(l) + '</p>'; }).join('');
+    btn.className = 'cfbtn ' + (opts.danger ? 'danger' : 'go');
+    btn.textContent = opts.confirmLabel || '확인';
+    var armed = !opts.twoStep;
+    var finish = function(v){ ov.classList.remove('on'); btn.onclick = null; cancel.onclick = null; resolve(v); };
+    btn.onclick = function(){
+      if(!armed){ armed = true;
+        btn.textContent = '한 번 더 확인 — ' + (opts.confirmLabel || '확인');
+        document.getElementById('cf-body').innerHTML +=
+          '<p class="cf-warn">⚠ 되돌리려면 직접 해제해야 합니다. 정말 진행할까요?</p>';
+        return; }
+      finish(true);
+    };
+    cancel.onclick = function(){ finish(false); };
+    ov.classList.add('on');
+  });
 }
+
+// 조치 후 8초간 '실행 취소' 버튼을 띄운다(실수로 눌러도 되돌릴 수 있게).
+var __toastTimer = null;
+function showUndo(msg, undoFn){
+  var t = document.getElementById('toast');
+  t.innerHTML = '<span>' + esc(msg) + '</span>' + (undoFn ? '<button id="undoBtn">실행 취소</button>' : '');
+  t.classList.add('on');
+  if(undoFn){ document.getElementById('undoBtn').onclick = function(){ t.classList.remove('on'); undoFn(); }; }
+  clearTimeout(__toastTimer);
+  __toastTimer = setTimeout(function(){ t.classList.remove('on'); }, 8000);
+}
+
+// 차단(영구 ttl=0 / 임시 ttl=초 / 대역 scope='subnet'). 심각한 건 2단계 확인, 성공 시 실행취소 제공.
+function doBlock(ip, scope, ttl){
+  var title, lines;
+  if(scope === 'subnet'){
+    title = '대역 차단 (매우 신중히)';
+    lines = ['대역 ' + subnet24(ip) + ' 전체(약 254개 IP)를 막습니다.',
+             '공격자가 IP를 바꿔가며 올 때 쓰는 강한 조치입니다.',
+             '사내 직원 IP가 포함될 수 있으니 특히 신중하세요.'];
+  } else if(ttl){
+    title = '임시 차단 (' + (ttl/60) + '분)';
+    lines = [ip + ' 를 ' + (ttl/60) + '분간 막고 자동으로 풉니다.',
+             '실수로 눌러도 시간이 지나면 저절로 해제됩니다.'];
+  } else {
+    title = '영구 차단';
+    lines = [ip + ' 의 들어오는 연결을 계속 막습니다(직접 해제 전까지).',
+             '실제 차단은 관리자 권한이 필요합니다.'];
+  }
+  var severe = (scope === 'subnet') || !ttl;      // 영구·대역 = 한 번 더(2단계)
+  askConfirm({title:title, lines:lines, confirmLabel:'차단', danger:true, twoStep:severe})
+    .then(function(ok){
+      if(!ok){ return; }
+      postJSON('/api/block', {ip:ip, scope:scope, ttl:ttl}).then(function(res){
+        if(res.ok){
+          var key = res.key || ip;
+          showUndo('✅ ' + (res.message || '차단됨'), function(){
+            postJSON('/api/unblock', {ip:key}).then(function(){ tick(); });
+          });
+        } else {
+          showUndo('⚠ ' + (res.message || '') + (res.detail ? ('  (' + res.detail + ')') : ''), null);
+        }
+        closeDetail(); tick();
+      });
+    });
+}
+
+// 증거 저장 — 그 IP 침투 기록을 파일로(간단·안전). 경로를 보여줘야 해서 alert 사용.
+function doEvidence(ip){
+  askConfirm({title:'증거 저장', confirmLabel:'저장', danger:false, twoStep:false,
+    lines:[ip + ' 관련 침투 기록을 파일로 내보냅니다.', '보고·신고용 증거로 쓸 수 있어요.']})
+    .then(function(ok){
+      if(!ok){ return; }
+      postJSON('/api/evidence', {ip:ip}).then(function(res){
+        alert((res.ok ? '✅ ' : '⚠ ') + (res.message || ''));
+      });
+    });
+}
+
+// 차단 해제(되돌리기) — 차단된 IP 띠와 상세창에서 호출.
+function unblockIp(key){
+  askConfirm({title:'차단 해제', confirmLabel:'해제', danger:false, twoStep:false,
+    lines:[key + ' 차단을 해제하고 다시 연결을 허용합니다.']})
+    .then(function(ok){
+      if(!ok){ return; }
+      postJSON('/api/unblock', {ip:key}).then(function(res){
+        showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''), null);
+        closeDetail(); tick();
+      });
+    });
+}
+
+// 오탐 처리(신뢰 IP) — 이건 공격이 아님. 이후 세지도 보여주지도 않는다. 되돌리기 제공.
+function doTrust(ip){
+  askConfirm({title:'오탐 처리 (신뢰 IP)', confirmLabel:'신뢰', danger:false, twoStep:false,
+    lines:[ip + ' 를 신뢰 IP로 표시합니다 — 이건 공격이 아니라고 보는 거예요.',
+           '이후 이 IP는 공격으로 세지도, 타임라인에 보이지도 않습니다.']})
+    .then(function(ok){
+      if(!ok){ return; }
+      postJSON('/api/trust', {ip:ip}).then(function(res){
+        showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''),
+          res.ok ? function(){ postJSON('/api/untrust', {ip:ip}).then(function(){ tick(); }); } : null);
+        closeDetail(); tick();
+      });
+    });
+}
+function untrustIp(ip){
+  askConfirm({title:'신뢰 해제', confirmLabel:'다시 탐지', danger:false, twoStep:false,
+    lines:[ip + ' 신뢰를 풀고 다시 탐지 대상으로 되돌립니다.']})
+    .then(function(ok){
+      if(!ok){ return; }
+      postJSON('/api/untrust', {ip:ip}).then(function(res){
+        showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''), null);
+        closeDetail(); tick();
+      });
+    });
+}
+
+// 자동 새로고침 일시정지 — 보는 중 화면이 튀지 않게(다시 누르면 즉시 갱신).
+function togglePause(){
+  PAUSED = !PAUSED;
+  var b = document.getElementById('pauseBtn');
+  if(b){ b.textContent = PAUSED ? '▶ 재생' : '⏸ 일시정지'; }
+  if(!PAUSED){ tick(); }
+}
+
 function openDetail(i){
   var e = LAST[i]; if(!e) return;
   var sc = e.severity === '위험' ? 'danger' : 'warn';
   var rec = e.rec || {};
+  var ipq = esc(e.ip);                               // onclick 에 넣을 IP(검증된 IPv4)
+  var isblk = BLOCKED.indexOf(e.ip) >= 0;            // 이미 차단된 IP 인가
   var acts = (rec.actions || []).map(function(a){ return '<li>' + esc(a) + '</li>'; }).join('');
   document.getElementById('m-title').innerHTML =
     '침투 상세 <span class="sev ' + sc + '">' + esc(e.severity) + '</span>';
@@ -1169,11 +1536,15 @@ function openDetail(i){
     +   (rec.caution ? '<div class="caution">⚠ ' + esc(rec.caution) + '</div>' : '')
     + '</div>'
     + '<div class="actions">'
-    +   ((BLOCKED.indexOf(e.ip) >= 0)
-          ? '<button class="actbtn unblock" onclick="unblockIp(&#39;' + esc(e.ip) + '&#39;)">✅ 이 IP 차단 해제</button>'
-          : '<button class="actbtn block" onclick="blockIp(&#39;' + esc(e.ip) + '&#39;)">🚫 이 IP 차단</button>')
-    +   '<span class="ahint">실제 윈도우 방화벽을 조작합니다 · 관리자 권한 필요 · '
-    +     '자기자신/사설IP는 거부 · 되돌리기 가능</span>'
+    +   (isblk
+          ? '<button class="actbtn unblock" onclick="unblockIp(&#39;' + ipq + '&#39;)">✅ 차단 해제</button>'
+          : '<button class="actbtn block" onclick="doBlock(&#39;' + ipq + '&#39;,&#39;ip&#39;,0)">🚫 영구 차단</button>'
+          + '<button class="actbtn temp" onclick="doBlock(&#39;' + ipq + '&#39;,&#39;ip&#39;,600)">⏱️ 임시 10분</button>'
+          + '<button class="actbtn subnet" onclick="doBlock(&#39;' + ipq + '&#39;,&#39;subnet&#39;,0)">🛡️ 대역 /24</button>')
+    +   '<button class="actbtn evic" onclick="doEvidence(&#39;' + ipq + '&#39;)">💾 증거 저장</button>'
+    +   '<button class="actbtn trust" onclick="doTrust(&#39;' + ipq + '&#39;)">✅ 오탐(신뢰)</button>'
+    +   '<div class="ahint">실제 윈도우 방화벽을 조작합니다 · 관리자 권한 필요 · '
+    +     '클릭하면 한 번 더 확인 · 되돌리기(실행 취소) 가능 · 자기자신/사설IP는 거부</div>'
     + '</div>';
   document.getElementById('overlay').classList.add('on');
 }
@@ -1186,6 +1557,7 @@ function copyCmd(btn){
 document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closeDetail(); });
 
 function tick(){
+  if(PAUSED){ return; }                               // 일시정지 중엔 갱신 안 함
   fetch('/api/alerts', {cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(d){ render(d); setStatus(true, d.generated); })
@@ -1205,13 +1577,16 @@ def run_dashboard(a):
     바인드 주소 기본값은 127.0.0.1(이 PC에서만 열람) — 사내망 공유는 --host 0.0.0.0.
     """
     state = {"payload": build_dashboard_payload([], []),   # 공유 저장소
-             "blocked": load_blocked(a.db)}                # 현재 차단 중인 IP(재시작해도 복원)
+             "blocked": load_blocked(a.db),                # 현재 차단 중인 IP(재시작해도 복원)
+             "trusted": load_trusted(a.db)}                # 신뢰(오탐 처리) IP — 탐지에서 제외
     lock = threading.Lock()                                # 스레드 간 안전장치
 
     if a.db:
         print(f"침투 흔적 DB: {a.db} (영구 저장)")
     if state["blocked"]:
         print(f"차단 중인 IP 복원: {len(state['blocked'])}개")
+    if state["trusted"]:
+        print(f"신뢰 IP 복원: {len(state['trusted'])}개")
 
     def scanner():
         """백그라운드: scan_interval 초마다 로그를 다시 읽어 최신 경보로 갱신.
@@ -1224,12 +1599,18 @@ def run_dashboard(a):
         while True:
             try:
                 events, _ = load_events(a.logfile, a.format)
+                with lock:
+                    trusted = set(state["trusted"])          # 신뢰 IP 스냅샷
+                if trusted:
+                    events = [e for e in events if e["ip"] not in trusted]  # 오탐 IP 제외
                 results = analyze(events, a.window, a.probe_threshold,
                                   a.auth_threshold, a.rate_threshold, a.score_threshold)
                 dist = detect_distributed(events, a.window, a.dist_threshold)
                 if conn is not None:
                     store_events(conn, events)               # 흔적을 DB 에 영구 저장
                     timeline = recent_intrusions(conn, 60)   # 타임라인은 DB 에서(과거까지)
+                    if trusted:
+                        timeline = [t for t in timeline if t["ip"] not in trusted]  # 과거 저장분도 숨김
                 else:
                     timeline = build_timeline(events, 60)     # DB 없으면 현재 로그에서
                 payload = build_dashboard_payload(results, dist, timeline)
@@ -1255,6 +1636,7 @@ def run_dashboard(a):
                 with lock:
                     resp = dict(state["payload"])                 # 얕은 복사 후
                     resp["blocked"] = sorted(state["blocked"])    # 현재 차단 목록을 끼워 보냄
+                    resp["trusted"] = sorted(state["trusted"])    # 신뢰(오탐) 목록도
                 body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
             elif self.path.startswith("/api/blocks"):
@@ -1268,8 +1650,9 @@ def run_dashboard(a):
             else:
                 self._send(404, b"not found", "text/plain; charset=utf-8")
 
-        def do_POST(self):   # noqa: N802 — '이 IP 차단/해제' 버튼이 부르는 창구
-            if self.path not in ("/api/block", "/api/unblock"):
+        def do_POST(self):   # noqa: N802 — 조치 버튼(차단/해제/증거/신뢰)이 부르는 창구
+            if self.path not in ("/api/block", "/api/unblock", "/api/evidence",
+                                 "/api/trust", "/api/untrust"):
                 self._send(404, b"not found", "text/plain; charset=utf-8")
                 return
             try:
@@ -1281,15 +1664,37 @@ def run_dashboard(a):
                 return
             ip = (data.get("ip") or "").strip()
             if self.path == "/api/block":
-                res = block_ip(a.db, ip, data.get("reason") or "상황판에서 차단")
+                scope = "subnet" if data.get("scope") == "subnet" else "ip"
+                res = block_ip(a.db, ip, data.get("reason") or "상황판에서 차단", scope)
                 if res.get("ok"):
+                    key = res.get("key") or ip
                     with lock:
-                        state["blocked"].add(ip)
-            else:
+                        state["blocked"].add(key)
+                    ttl = data.get("ttl")           # 임시 차단: N초 뒤 자동 해제
+                    if ttl:
+                        def _auto_unblock(k=key):
+                            unblock_ip(a.db, k)
+                            with lock:
+                                state["blocked"].discard(k)
+                        threading.Timer(float(ttl), _auto_unblock).start()
+                        res["message"] += f"  ⏱️ {int(float(ttl))//60}분 뒤 자동 해제됩니다."
+            elif self.path == "/api/unblock":
                 res = unblock_ip(a.db, ip)
                 if res.get("ok"):
                     with lock:
-                        state["blocked"].discard(ip)
+                        state["blocked"].discard(res.get("key") or ip)
+            elif self.path == "/api/trust":
+                res = trust_ip(a.db, ip)
+                if res.get("ok"):
+                    with lock:
+                        state["trusted"].add(ip)
+            elif self.path == "/api/untrust":
+                res = untrust_ip(a.db, ip)
+                if res.get("ok"):
+                    with lock:
+                        state["trusted"].discard(ip)
+            else:                                   # /api/evidence
+                res = export_evidence(a.db, ip)
             self._send(200, json.dumps(res, ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
 
