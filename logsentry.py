@@ -1049,27 +1049,28 @@ _DASHBOARD_HTML = """<!doctype html>
   tr.clk:hover td { background:var(--hover); }                   /* 마우스 올린 행 강조 */
   /* 상세창(모달) */
   #overlay { position:fixed; inset:0; background:var(--overlay); display:none;
-             align-items:flex-start; justify-content:center; padding:40px 16px; z-index:50; }
+             align-items:flex-start; justify-content:center; padding:28px 16px; z-index:50; }
   #overlay.on { display:flex; }
-  .modal { background:var(--panel); border:1px solid var(--border2); border-radius:12px;
-           max-width:640px; width:100%; max-height:85vh; overflow:auto; }
-  .modal .mh { padding:16px 20px; border-bottom:1px solid var(--border);
-               display:flex; align-items:center; justify-content:space-between; }
-  .modal .mh h3 { margin:0; font-size:16px; }
-  .modal .mx { cursor:pointer; color:var(--muted); font-size:20px; background:none; border:none; }
-  .modal .mb { padding:18px 20px; }
-  .kv { display:grid; grid-template-columns:96px 1fr; gap:8px 12px; font-size:14px; margin-bottom:16px; }
+  .modal { background:var(--panel); border:1px solid var(--border2); border-radius:14px;
+           max-width:820px; width:100%; max-height:90vh; overflow:auto; }
+  .modal .mh { padding:18px 26px; border-bottom:1px solid var(--border);
+               display:flex; align-items:center; justify-content:space-between; position:sticky; top:0;
+               background:var(--panel); z-index:1; }
+  .modal .mh h3 { margin:0; font-size:19px; }
+  .modal .mx { cursor:pointer; color:var(--muted); font-size:22px; background:none; border:none; }
+  .modal .mb { padding:22px 26px 26px; }
+  .kv { display:grid; grid-template-columns:120px 1fr; gap:11px 18px; font-size:15px; margin-bottom:22px; }
   .kv .k { color:var(--muted); }
   .kv .v { word-break:break-all; }
-  .rec { background:var(--inset); border:1px solid var(--border); border-radius:10px; padding:14px; }
-  .rec h4 { margin:0 0 8px; font-size:14px; color:var(--accent);
+  .rec { background:var(--inset); border:1px solid var(--border); border-radius:10px; padding:16px 18px; }
+  .rec h4 { margin:0 0 10px; font-size:15px; color:var(--accent);
             display:flex; align-items:center; gap:8px; }
-  .rec h4 .rtag { font-size:11px; font-weight:500; color:var(--faint); letter-spacing:.02em; }
+  .rec h4 .rtag { font-size:11.5px; font-weight:500; color:var(--faint); letter-spacing:.02em; }
   .disc { background:var(--disc-bg); border:1px solid var(--disc-bd); color:var(--disc-fg);
-          border-radius:8px; padding:9px 11px; font-size:12.5px; line-height:1.55; margin-bottom:12px; }
-  .rec ul { margin:8px 0 0; padding-left:18px; }
-  .rec li { margin:6px 0; font-size:14px; line-height:1.5; }
-  .caution { margin-top:12px; font-size:13px; color:var(--warn); line-height:1.5; }
+          border-radius:8px; padding:10px 13px; font-size:13px; line-height:1.55; margin-bottom:13px; }
+  .rec ul { margin:10px 0 0; padding-left:20px; }
+  .rec li { margin:7px 0; font-size:15px; line-height:1.55; }
+  .caution { margin-top:13px; font-size:13.5px; color:var(--warn); line-height:1.55; }
   .sev { padding:2px 10px; border-radius:20px; font-size:12px; font-weight:600; }
   .sev.danger { background:var(--bdg-d-bg); color:var(--bdg-d-fg); }
   .sev.warn { background:var(--bdg-w-bg); color:var(--bdg-w-fg); }
