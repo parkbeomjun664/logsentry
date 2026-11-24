@@ -339,11 +339,19 @@ class TestDashboardAndDB(unittest.TestCase):
         return [e for e in (parse_line(l) for l in lines) if e]
 
     def test_payload_counts_each_request_once(self):
-        """공격 요청(건)=없는주소+인증거부 — 탐침을 중복으로 두 번 세어 부풀리지 않는다."""
+        """공격 요청(건)=공격자가 보낸 요청 수 — 한 요청을 한 번만 세고 소음(favicon)은 뺀다."""
         results = analyze(self._events(), **DEFAULTS)
         p = build_dashboard_payload(results, [], [])
-        self.assertEqual(p["attempt_count"], 6)   # 404 6건(탐침 6을 더해 12로 부풀면 안 됨)
+        self.assertEqual(p["attempt_count"], 6)   # 요청 6건(favicon 제외, 탐침을 더해 12로 부풀면 안 됨)
         self.assertEqual(p["ip_count"], 1)
+
+    def test_attempt_count_on_redirect_server(self):
+        """리다이렉트(307) 서버 — 404가 0이라도 공격 요청 수가 실제값으로 잡힌다(ShotTrace 교훈)."""
+        lines = [nginx("203.0.113.77", f"09:00:0{i}", "GET", p, 307, "sqlmap/1.7")
+                 for i, p in enumerate(PROBES)]
+        events = [e for e in (parse_line(l) for l in lines) if e]
+        p = build_dashboard_payload(analyze(events, **DEFAULTS), [], [])
+        self.assertEqual(p["attempt_count"], len(PROBES))   # 307이어도 6건으로 잡힘(옛 지표는 0)
 
     def test_timeline_newest_first_and_skips_noise(self):
         """타임라인은 최근 공격이 맨 위, 정상 소음(favicon)은 제외."""

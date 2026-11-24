@@ -228,7 +228,7 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
             "ip": ip, "score": score,
             "level": "alert" if score >= score_threshold else "watch",
             "distinct_paths": len(d["paths"]), "nf": d["nf"], "auth": d["auth"],
-            "probes": d["probes"], "tool": d["tool"], "rate": burst,
+            "probes": d["probes"], "tool": d["tool"], "rate": burst, "reqs": d["reqs"],
             "first": d["first"], "last": d["last"], "reasons": reasons,
         })
 
@@ -954,9 +954,10 @@ def build_dashboard_payload(results, dist, timeline=None):
         "ip_count": len(results),                 # 공격 의심 IP 수
         "alert_count": len(alerts),               # 위험(경보)
         "watch_count": len(watches),              # 경고(관찰)
-        # '공격 요청(건)' = 악성으로 보이는 요청 수(없는주소 404 + 인증거부).
-        # 탐침경로는 대개 404 와 '같은 요청'이라 더하지 않는다 — 한 요청을 한 번만 센다.
-        "attempt_count": sum(r["nf"] + r["auth"] for r in results),
+        # '공격 요청(건)' = 탐지된 공격자 IP 들이 보낸 요청 수(reqs).
+        # 상태코드와 무관 — 리다이렉트(307) 서버에서도 실제 공격량이 숫자로 잡힌다.
+        # (reqs 는 _SKIP·신뢰 IP 를 뺀 수라, 소음은 세지 않고 한 요청을 한 번만 센다.)
+        "attempt_count": sum(r["reqs"] for r in results),
         "alerts": rows,
         "dist": dist,
         "timeline": timeline or [],   # 개별 공격 시간 순(최근 먼저) — 바깥에서 만들어 넘김
