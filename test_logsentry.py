@@ -17,7 +17,7 @@ from logsentry import (LoginTracker, _block_refusal, _is_private, _subnet24,
                        _target_rule, _valid_ipv4, alert_key, analyze,
                        analyze_logins, block_ip, build_dashboard_payload,
                        build_timeline, detect_distributed, export_evidence,
-                       load_config, load_trusted, open_db, parse_line,
+                       load_config, load_history, load_trusted, open_db, parse_line,
                        recent_intrusions, recommend, send_webhook, store_events,
                        trust_ip, unblock_ip, untrust_ip)
 
@@ -515,6 +515,43 @@ class TestTrustAndPanels(unittest.TestCase):
         self.assertTrue(p["top_paths"])
         counts = [x["count"] for x in p["top_paths"]]
         self.assertEqual(counts, sorted(counts, reverse=True))       # 내림차순
+
+
+class TestHistoryScreen(unittest.TestCase):
+    """[v3.3] 숫자 칸 클릭 목록 · 조치 기록 화면 — 대표님 요청."""
+
+    def test_history_lists_trusted_and_audit_newest_first(self):
+        """조치 기록: 신뢰 IP와 조치 이력(최근 먼저)이 담기고, 거부된 시도도 남는다."""
+        fd, dbp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            block_ip(dbp, "127.0.0.1")              # 거부(refused) — 이력엔 남아야 함
+            trust_ip(dbp, "198.51.100.9")           # 신뢰(ok)
+            h = load_history(dbp)
+            self.assertTrue(h["db"])
+            self.assertEqual([t["ip"] for t in h["trusted"]], ["198.51.100.9"])
+            self.assertEqual(h["blocked"], [])      # 실제 차단 성공은 없음
+            actions = [(a["action"], a["result"]) for a in h["audit"]]
+            self.assertIn(("block", "refused"), actions)
+            self.assertIn(("trust", "ok"), actions)
+            ts = [a["ts"] for a in h["audit"]]
+            self.assertEqual(ts, sorted(ts, reverse=True))   # 최근 먼저
+        finally:
+            os.remove(dbp)
+
+    def test_history_without_db_is_empty_not_error(self):
+        """DB 가 꺼져 있으면 빈 기록(db=False)을 돌려줄 뿐 오류가 나지 않는다."""
+        h = load_history("")
+        self.assertFalse(h["db"])
+        self.assertEqual((h["blocked"], h["trusted"], h["audit"]), ([], [], []))
+
+    def test_alert_rows_carry_request_count(self):
+        """위험/경고 목록 화면용 — IP별 행에 요청 수(reqs)가 실린다."""
+        lines = [nginx("203.0.113.77", f"09:00:0{i}", "GET", p, 404, "sqlmap")
+                 for i, p in enumerate(PROBES)]
+        events = [e for e in (parse_line(l) for l in lines) if e]
+        p = build_dashboard_payload(analyze(events, **DEFAULTS), [], [])
+        self.assertEqual(p["alerts"][0]["reqs"], len(PROBES))
 
 
 if __name__ == "__main__":

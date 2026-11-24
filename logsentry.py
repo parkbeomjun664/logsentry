@@ -899,6 +899,31 @@ def load_trusted(db_path):
         return set()
 
 
+def load_history(db_path, limit=200):
+    """'조치 기록' 화면용 — 지금 차단 중인 대상 · 신뢰 IP · 조치 이력(최근 먼저)."""
+    empty = {"blocked": [], "trusted": [], "audit": [], "db": bool(db_path)}
+    if not db_path or not os.path.exists(db_path):
+        return empty
+    try:
+        conn = open_db(db_path)
+        blocked = [{"ip": ip, "reason": reason or "", "blocked_at": at or ""}
+                   for ip, reason, at in conn.execute(
+                       "SELECT ip, reason, blocked_at FROM blocklist"
+                       " WHERE active=1 ORDER BY blocked_at DESC").fetchall()]
+        trusted = [{"ip": ip, "added_at": at or ""}
+                   for ip, at in conn.execute(
+                       "SELECT ip, added_at FROM trusted ORDER BY added_at DESC").fetchall()]
+        audit = [{"ts": ts or "", "ip": ip or "", "action": action or "",
+                  "result": result or "", "detail": (detail or "")[:200]}
+                 for ts, ip, action, result, detail in conn.execute(
+                     "SELECT ts, ip, action, result, detail FROM block_audit"
+                     " ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()]
+        conn.close()
+        return {"blocked": blocked, "trusted": trusted, "audit": audit, "db": True}
+    except Exception:  # noqa: BLE001
+        return empty
+
+
 def print_db(path, limit):
     """쌓인 침투 흔적 DB 를 표로 출력 — 상황판을 켜지 않고도 터미널에서 바로 조회."""
     if not os.path.exists(path):
@@ -938,7 +963,7 @@ def build_dashboard_payload(results, dist, timeline=None):
             "ip": r["ip"], "score": r["score"], "level": r["level"],
             "distinct_paths": r["distinct_paths"], "nf": r["nf"],
             "auth": r["auth"], "probes": r["probes"], "tool": r["tool"],
-            "rate": r["rate"], "reasons": r["reasons"],
+            "rate": r["rate"], "reasons": r["reasons"], "reqs": r.get("reqs", 0),
             "first": _iso(r["first"]), "last": _iso(r["last"]),
             "time": r["last"].strftime("%H:%M:%S") if r["last"] else "—",
         })
@@ -1024,6 +1049,35 @@ _DASHBOARD_HTML = """<!doctype html>
   .tile .l { font-size:12px; color:var(--muted); margin-top:8px; letter-spacing:.02em; }
   .tile.danger .n { color:var(--danger); }
   .tile.warn .n { color:var(--warn); }
+  .tile.clk { cursor:pointer; transition:border-color .15s, transform .15s; }
+  .tile.clk:hover { border-color:var(--accent); transform:translateY(-1px); }
+  .tile .more { float:right; color:var(--faint); font-size:11px; }
+  .tile.clk:hover .more { color:var(--accent); }
+  /* IP 목록 · 조치 기록 화면 (상세창 재사용) */
+  .modal.wide { max-width:1040px; }
+  .ltab { width:100%; border-collapse:collapse; font-size:13.5px; }
+  .ltab th { text-align:left; color:var(--muted); font-weight:500; font-size:12px;
+             padding:8px 10px; border-bottom:1px solid var(--border2); white-space:nowrap; }
+  .ltab td { padding:9px 10px; border-bottom:1px solid var(--rowline); vertical-align:top; }
+  .ltab tbody tr:nth-child(even) td { background:var(--stripe); }
+  .ltab .mono { font-family:ui-monospace,Consolas,monospace; }
+  .ltab .why { color:var(--muted); font-size:12.5px; }
+  .ltab .det { color:var(--faint); font-size:12px; max-width:320px; word-break:break-all; }
+  .lbtn { background:var(--btn-bg); color:var(--btn-fg); border:1px solid var(--border2);
+          border-radius:7px; padding:3px 9px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  .lbtn:hover { border-color:var(--accent); }
+  .lv { padding:2px 9px; border-radius:20px; font-size:11.5px; font-weight:600; white-space:nowrap; }
+  .lv.alert, .lv.failed { background:var(--bdg-d-bg); color:var(--bdg-d-fg); }
+  .lv.watch, .lv.refused { background:var(--bdg-w-bg); color:var(--bdg-w-fg); }
+  .lv.ok { background:rgba(46,160,67,.15); color:var(--green); }
+  .lv.na { background:var(--btn-bg); color:var(--muted); }
+  .hsec { font-size:13px; font-weight:600; color:var(--muted); margin:18px 0 8px;
+          display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .hsec:first-child { margin-top:0; }
+  .hsec .cnt { color:var(--faint); font-weight:400; }
+  .hfil { display:flex; gap:6px; flex-wrap:wrap; margin-left:auto; }
+  .hempty { color:var(--faint); font-size:13px; padding:10px 2px; }
+  .hscroll { max-height:46vh; overflow:auto; border:1px solid var(--border); border-radius:8px; }
   #dist { padding:0 20px; }
   #dist .d { background:var(--dist-bg); border:1px solid var(--dist-bd); color:var(--dist-fg);
              border-radius:8px; padding:10px 12px; margin-bottom:10px; font-size:14px; }
@@ -1162,6 +1216,7 @@ _DASHBOARD_HTML = """<!doctype html>
   <header>
     <h1>🛡️ LogSentry — 실시간 침입 감시</h1>
     <div class="hr">
+      <button class="tbtn" onclick="openHistory()">📋 조치 기록</button>
       <button id="pauseBtn" class="tbtn" onclick="togglePause()">⏸ 일시정지</button>
       <button id="themeBtn" class="tbtn" onclick="toggleTheme()">☀ 밝게</button>
       <span id="status"><span class="dot"></span>연결 중…</span>
@@ -1169,10 +1224,14 @@ _DASHBOARD_HTML = """<!doctype html>
   </header>
 
   <div class="tiles">
-    <div class="tile"><div class="n" id="attempt">0</div><div class="l">공격 요청(건)</div></div>
-    <div class="tile warn"><div class="n" id="warn">0</div><div class="l">경고</div></div>
-    <div class="tile danger"><div class="n" id="danger">0</div><div class="l">위험</div></div>
-    <div class="tile"><div class="n" id="ipc">0</div><div class="l">공격 의심 IP</div></div>
+    <div class="tile clk" onclick="tileClick('attempt')" title="클릭: 공격 요청 전체를 타임라인에서 보기">
+      <div class="n" id="attempt">0</div><div class="l">공격 요청(건) <span class="more">보기 ›</span></div></div>
+    <div class="tile warn clk" onclick="tileClick('watch')" title="클릭: 경고 단계 IP 목록">
+      <div class="n" id="warn">0</div><div class="l">경고 <span class="more">보기 ›</span></div></div>
+    <div class="tile danger clk" onclick="tileClick('alert')" title="클릭: 위험 단계 IP 목록">
+      <div class="n" id="danger">0</div><div class="l">위험 <span class="more">보기 ›</span></div></div>
+    <div class="tile clk" onclick="tileClick('all')" title="클릭: 공격 의심 IP 전체 목록">
+      <div class="n" id="ipc">0</div><div class="l">공격 의심 IP <span class="more">보기 ›</span></div></div>
   </div>
 
   <div id="toppanels" class="toppanels"></div>
@@ -1249,6 +1308,9 @@ var FILTER = '전체';    // 지금 고른 종류별 필터
 var KINDS = [];         // 탭에 뜬 종류 순서
 var SEARCH = '';        // 검색어(IP·경로·도구)
 var PAUSED = false;     // 자동 새로고침 일시정지
+var ALERTS = [];        // IP별 탐지 결과(단계·점수·이유) — 위 숫자 칸 클릭 시 목록
+var LISTROWS = [];      // 지금 띄운 IP 목록(버튼은 인덱스로 참조 — 문자열을 onclick 에 넣지 않음)
+var HISTORY_OPEN = false, HIST = null, HFILTER = 0;
 
 function render(d){
   document.getElementById('attempt').textContent = d.attempt_count;
@@ -1263,6 +1325,7 @@ function render(d){
   }).join('');
 
   LAST = d.timeline || [];
+  ALERTS = d.alerts || [];
   BLOCKED = d.blocked || [];
   TRUSTED = d.trusted || [];
   renderTop(d);
@@ -1476,7 +1539,7 @@ function unblockIp(key){
       if(!ok){ return; }
       postJSON('/api/unblock', {ip:key}).then(function(res){
         showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''), null);
-        closeDetail(); tick();
+        afterAction();
       });
     });
 }
@@ -1502,7 +1565,7 @@ function untrustIp(ip){
       if(!ok){ return; }
       postJSON('/api/untrust', {ip:ip}).then(function(res){
         showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''), null);
-        closeDetail(); tick();
+        afterAction();
       });
     });
 }
@@ -1515,8 +1578,144 @@ function togglePause(){
   if(!PAUSED){ tick(); }
 }
 
+// 상세창(#overlay)을 목록·기록 화면으로도 재사용 — 넓게/보통 전환
+function showModal(titleHtml, bodyHtml, wide){
+  document.querySelector('#overlay .modal').classList.toggle('wide', !!wide);
+  document.getElementById('m-title').innerHTML = titleHtml;
+  document.getElementById('m-body').innerHTML = bodyHtml;
+  document.getElementById('overlay').classList.add('on');
+}
+// 조치 후: 기록 화면을 보고 있었으면 그 화면을 새로 그리고, 아니면 창을 닫는다
+function afterAction(){
+  if(HISTORY_OPEN){ openHistory(); } else { closeDetail(); }
+  tick();
+}
+function fmtTs(s){ return s ? String(s).replace('T', ' ').slice(0, 19) : '—'; }
+function scrollToTimeline(){
+  var t = document.getElementById('rows');
+  if(t){ t.scrollIntoView({behavior:'smooth', block:'start'}); }
+}
+
+// 위 숫자 칸 클릭
+function tileClick(kind){
+  if(kind === 'attempt'){            // 공격 요청 → 필터 풀고 타임라인 전체로
+    closeDetail();
+    FILTER = '전체'; renderFilters();
+    onSearch('', true);
+    scrollToTimeline();
+    return;
+  }
+  openIpList(kind);                  // 경고 / 위험 / 전체 → IP 목록
+}
+
+var LEVEL_KO = {alert:'위험', watch:'경고'};
+function openIpList(kind){
+  var title = {alert:'🔴 위험 단계 IP', watch:'🟡 경고 단계 IP', all:'🎯 공격 의심 IP 전체'}[kind];
+  LISTROWS = ALERTS.filter(function(r){ return kind === 'all' || r.level === kind; })
+                   .sort(function(a, b){ return b.score - a.score; });
+  var body = '<div class="hsec">' + LISTROWS.length + '개 IP '
+    + '<span class="cnt">· 위험 = 종합 점수가 문턱 이상 · 경고 = 의심 신호는 있지만 점수가 낮음</span></div>';
+  if(!LISTROWS.length){
+    body += '<div class="hempty">해당 단계의 IP가 없습니다 👍</div>';
+  } else {
+    body += '<table class="ltab"><thead><tr><th>IP</th><th>단계</th><th>점수</th><th>요청</th>'
+      + '<th>탐지 이유</th><th>마지막 공격</th><th></th></tr></thead><tbody>'
+      + LISTROWS.map(function(r, i){
+          var blk = BLOCKED.indexOf(r.ip) >= 0 ? ' <span class="badge blk">차단됨</span>' : '';
+          return '<tr><td class="mono">' + esc(r.ip) + blk + '</td>'
+            + '<td><span class="lv ' + esc(r.level) + '">' + (LEVEL_KO[r.level] || esc(r.level)) + '</span></td>'
+            + '<td>' + r.score + '</td><td>' + (r.reqs || 0) + '</td>'
+            + '<td class="why">' + esc((r.reasons || []).join(' · ')) + '</td>'
+            + '<td class="mono">' + esc(fmtTs(r.last)) + '</td>'
+            + '<td><button class="lbtn" onclick="viewRow(' + i + ')">타임라인 보기 ›</button></td></tr>';
+        }).join('')
+      + '</tbody></table>';
+  }
+  HISTORY_OPEN = false;
+  showModal(title, body, true);
+}
+function viewRow(i){
+  var r = LISTROWS[i]; if(!r){ return; }
+  closeDetail();
+  FILTER = '전체'; renderFilters();
+  onSearch(r.ip, true);
+  scrollToTimeline();
+}
+
+// ── 조치 기록 화면: 지금 차단 중 · 신뢰 IP · 조치 이력 ──
+var ACT_KO = {block:'차단', unblock:'해제', trust:'신뢰(오탐)', untrust:'신뢰 해제', evidence:'증거 저장'};
+var RES_KO = {ok:'성공', failed:'실패', refused:'거부'};
+var HTABS = [
+  {name:'전체',      f:function(a){ return true; }},
+  {name:'차단',      f:function(a){ return a.action === 'block'; }},
+  {name:'해제',      f:function(a){ return a.action === 'unblock' || a.action === 'untrust'; }},
+  {name:'신뢰',      f:function(a){ return a.action === 'trust'; }},
+  {name:'증거',      f:function(a){ return a.action === 'evidence'; }},
+  {name:'실패·거부', f:function(a){ return a.result !== 'ok'; }}
+];
+function openHistory(){
+  HISTORY_OPEN = true;
+  showModal('📋 조치 기록', '<div class="hempty">불러오는 중…</div>', true);
+  fetch('/api/history', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(h){ HIST = h; renderHistory(); })
+    .catch(function(){ HIST = null;
+      document.getElementById('m-body').innerHTML = '<div class="hempty">불러오지 못했어요 — 서버 연결을 확인하세요.</div>'; });
+}
+function setHistFilter(i){ HFILTER = i; renderHistory(); }
+function histUnblock(i){ var b = HIST && HIST.blocked[i]; if(b){ unblockIp(b.ip); } }
+function histUntrust(i){ var t = HIST && HIST.trusted[i]; if(t){ untrustIp(t.ip); } }
+function renderHistory(){
+  var h = HIST || {blocked:[], trusted:[], audit:[], db:false};
+  var out = '';
+  if(!h.db){
+    out += '<div class="disc">※ 기록 저장(DB)이 꺼져 있어서 남은 기록이 없어요. 상황판을 --db 옵션과 함께 켜면 쌓입니다.</div>';
+  }
+  // 1) 지금 차단 중
+  out += '<div class="hsec">🚫 지금 차단 중 <span class="cnt">' + h.blocked.length + '</span></div>';
+  out += h.blocked.length
+    ? '<table class="ltab"><thead><tr><th>대상</th><th>차단 시각</th><th>사유</th><th></th></tr></thead><tbody>'
+      + h.blocked.map(function(b, i){
+          return '<tr><td class="mono">' + esc(b.ip) + '</td><td class="mono">' + esc(fmtTs(b.blocked_at)) + '</td>'
+            + '<td class="why">' + esc(b.reason || '—') + '</td>'
+            + '<td><button class="lbtn" onclick="histUnblock(' + i + ')">해제</button></td></tr>';
+        }).join('') + '</tbody></table>'
+    : '<div class="hempty">차단 중인 IP가 없어요.</div>';
+  // 2) 신뢰 IP
+  out += '<div class="hsec">✅ 신뢰 IP (오탐 처리) <span class="cnt">' + h.trusted.length + '</span></div>';
+  out += h.trusted.length
+    ? '<table class="ltab"><thead><tr><th>IP</th><th>등록 시각</th><th></th></tr></thead><tbody>'
+      + h.trusted.map(function(t, i){
+          return '<tr><td class="mono">' + esc(t.ip) + '</td><td class="mono">' + esc(fmtTs(t.added_at)) + '</td>'
+            + '<td><button class="lbtn" onclick="histUntrust(' + i + ')">다시 탐지</button></td></tr>';
+        }).join('') + '</tbody></table>'
+    : '<div class="hempty">신뢰 IP가 없어요.</div>';
+  // 3) 조치 이력
+  var tab = HTABS[HFILTER] || HTABS[0];
+  var rows = h.audit.filter(tab.f);
+  out += '<div class="hsec">🧾 조치 이력 <span class="cnt">' + rows.length + ' / ' + h.audit.length + '</span>'
+    + '<div class="hfil">' + HTABS.map(function(t, i){
+        return '<button class="fbtn' + (i === HFILTER ? ' on' : '') + '" onclick="setHistFilter(' + i + ')">' + t.name + '</button>';
+      }).join('') + '</div></div>';
+  out += rows.length
+    ? '<div class="hscroll"><table class="ltab"><thead><tr><th>시각</th><th>대상</th><th>조치</th><th>결과</th><th>상세</th></tr></thead><tbody>'
+      + rows.map(function(a){
+          var rc = a.result === 'ok' ? 'ok' : (a.result === 'failed' ? 'failed' : (a.result === 'refused' ? 'refused' : 'na'));
+          return '<tr><td class="mono">' + esc(fmtTs(a.ts)) + '</td><td class="mono">' + esc(a.ip) + '</td>'
+            + '<td>' + esc(ACT_KO[a.action] || a.action) + '</td>'
+            + '<td><span class="lv ' + rc + '">' + esc(RES_KO[a.result] || a.result) + '</span></td>'
+            + '<td class="det" title="' + esc(a.detail) + '">' + esc(a.detail) + '</td></tr>';
+        }).join('') + '</tbody></table></div>'
+    : '<div class="hempty">해당하는 조치 기록이 없어요.</div>';
+  document.getElementById('m-title').innerHTML =
+    '📋 조치 기록 <button class="lbtn" onclick="openHistory()">↻ 새로고침</button>';
+  document.getElementById('m-body').innerHTML = out;
+}
+
 function openDetail(i){
   var e = LAST[i]; if(!e) return;
+  HISTORY_OPEN = false;
+  document.querySelector('#overlay .modal').classList.remove('wide');
   var sc = e.severity === '위험' ? 'danger' : 'warn';
   var rec = e.rec || {};
   var ipq = esc(e.ip);                               // onclick 에 넣을 IP(검증된 IPv4)
@@ -1552,7 +1751,7 @@ function openDetail(i){
     + '</div>';
   document.getElementById('overlay').classList.add('on');
 }
-function closeDetail(){ document.getElementById('overlay').classList.remove('on'); }
+function closeDetail(){ HISTORY_OPEN = false; document.getElementById('overlay').classList.remove('on'); }
 document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closeDetail(); });
 
 function tick(){
@@ -1642,6 +1841,10 @@ def run_dashboard(a):
                 with lock:
                     body = json.dumps({"blocked": sorted(state["blocked"])},
                                       ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+            elif self.path.startswith("/api/history"):
+                # 조치 기록 화면 — 요청마다 자기 DB 연결을 열고 닫는다(SQLite 스레드 규칙)
+                body = json.dumps(load_history(a.db), ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
             elif self.path == "/" or self.path.startswith("/?"):
                 self._send(200, _DASHBOARD_HTML.encode("utf-8"),
