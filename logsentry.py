@@ -1009,19 +1009,27 @@ _DASHBOARD_HTML = """<!doctype html>
   .tbtn:hover { border-color:var(--accent); }
   #status { font-size:12px; color:var(--muted); }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
-         background:var(--green); margin-right:6px; vertical-align:middle; }
+         background:var(--green); margin-right:6px; vertical-align:middle; animation:pulse 2s infinite; }
+  @keyframes pulse { 0%{ box-shadow:0 0 0 0 rgba(46,160,67,.5); }
+                     70%{ box-shadow:0 0 0 5px rgba(46,160,67,0); }
+                     100%{ box-shadow:0 0 0 0 rgba(46,160,67,0); } }
   .tiles { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; padding:20px; }
   @media (max-width:640px){ .tiles{ grid-template-columns:repeat(2,1fr); } }
-  .tile { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
-  .tile .n { font-size:34px; font-weight:700; line-height:1; }
-  .tile .l { font-size:13px; color:var(--muted); margin-top:8px; }
+  .tile { background:var(--panel); border:1px solid var(--border); border-top:3px solid var(--border2);
+          border-radius:10px; padding:15px 16px; }
+  .tile.danger { border-top-color:var(--danger); }
+  .tile.warn { border-top-color:var(--warn); }
+  .tile .n { font-size:32px; font-weight:700; line-height:1; font-variant-numeric:tabular-nums; }
+  .tile .l { font-size:12px; color:var(--muted); margin-top:8px; letter-spacing:.02em; }
   .tile.danger .n { color:var(--danger); }
   .tile.warn .n { color:var(--warn); }
   #dist { padding:0 20px; }
   #dist .d { background:var(--dist-bg); border:1px solid var(--dist-bd); color:var(--dist-fg);
              border-radius:8px; padding:10px 12px; margin-bottom:10px; font-size:14px; }
   .wrap { padding:8px 20px 28px; }
-  h2 { font-size:14px; color:var(--muted); font-weight:500; margin:12px 4px; }
+  h2 { font-size:12px; color:var(--faint); font-weight:600; letter-spacing:.04em;
+       text-transform:uppercase; margin:18px 4px 10px; }
+  h2 .h2sub { font-weight:400; letter-spacing:0; margin-left:8px; opacity:.85; }
   table { width:100%; border-collapse:collapse; font-size:14px; }
   th,td { text-align:left; padding:11px 12px; border-bottom:1px solid var(--rowline); }
   th { color:var(--muted); font-weight:500; font-size:12px; }
@@ -1054,16 +1062,13 @@ _DASHBOARD_HTML = """<!doctype html>
   .kv .k { color:var(--muted); }
   .kv .v { word-break:break-all; }
   .rec { background:var(--inset); border:1px solid var(--border); border-radius:10px; padding:14px; }
-  .rec h4 { margin:0 0 8px; font-size:14px; color:var(--accent); }
+  .rec h4 { margin:0 0 8px; font-size:14px; color:var(--accent);
+            display:flex; align-items:center; gap:8px; }
+  .rec h4 .rtag { font-size:11px; font-weight:500; color:var(--faint); letter-spacing:.02em; }
   .disc { background:var(--disc-bg); border:1px solid var(--disc-bd); color:var(--disc-fg);
           border-radius:8px; padding:9px 11px; font-size:12.5px; line-height:1.55; margin-bottom:12px; }
   .rec ul { margin:8px 0 0; padding-left:18px; }
   .rec li { margin:6px 0; font-size:14px; line-height:1.5; }
-  .cmd { margin-top:12px; background:var(--codebg); border:1px solid var(--border2); border-radius:8px;
-         padding:10px 34px 10px 12px; font-family:ui-monospace,Consolas,monospace;
-         font-size:12.5px; color:var(--cmd-fg); word-break:break-all; position:relative; }
-  .cmd button { position:absolute; top:6px; right:6px; font-size:11px; background:var(--btn-bg);
-                color:var(--btn-fg); border:1px solid var(--border2); border-radius:6px; padding:2px 8px; cursor:pointer; }
   .caution { margin-top:12px; font-size:13px; color:var(--warn); line-height:1.5; }
   .sev { padding:2px 10px; border-radius:20px; font-size:12px; font-weight:600; }
   .sev.danger { background:var(--bdg-d-bg); color:var(--bdg-d-fg); }
@@ -1088,14 +1093,16 @@ _DASHBOARD_HTML = """<!doctype html>
   .bchip button { background:var(--btn-bg); color:var(--btn-fg); border:1px solid var(--border2);
                   border-radius:12px; padding:1px 9px; font-size:11px; cursor:pointer; }
   /* 상세창 안의 실제 조치 버튼 */
-  .actions { margin-top:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
-  .actbtn { border:none; border-radius:8px; padding:9px 16px; font-size:13.5px; font-weight:600; cursor:pointer; }
-  .actbtn.block { background:var(--danger); color:#fff; }
-  .actbtn.unblock { background:var(--green); color:#fff; }
-  .actbtn.temp { background:var(--warn); color:#fff; }
-  .actbtn.subnet { background:#8957e5; color:#fff; }
-  .actbtn.evic { background:var(--btn-bg); color:var(--btn-fg); border:1px solid var(--border2); }
-  .actbtn.trust { background:#1f6feb; color:#fff; }
+  .actions { margin-top:16px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  /* 차분한 위계: 주 동작(차단/해제)만 채움, 나머지는 고스트 — 색 소음을 줄인다 */
+  .actbtn { border:1px solid var(--border2); background:var(--btn-bg); color:var(--btn-fg);
+            border-radius:8px; padding:8px 13px; font-size:13px; font-weight:600; cursor:pointer; }
+  .actbtn:hover { border-color:var(--accent); }
+  .actbtn.block { background:var(--danger); color:#fff; border-color:var(--danger); }
+  .actbtn.unblock { background:var(--green); color:#fff; border-color:var(--green); }
+  .actbtn.temp:hover { border-color:var(--warn); color:var(--warn); }
+  .actbtn.subnet:hover { border-color:#8957e5; color:#a371f7; }
+  .actbtn.trust:hover { border-color:var(--accent); color:var(--accent); }
   .actbtn:hover { opacity:.9; }
   .ahint { font-size:11.5px; color:var(--faint); line-height:1.45; width:100%; margin-top:4px; }
   /* 한 번 더 묻는 확인창 */
@@ -1172,20 +1179,20 @@ _DASHBOARD_HTML = """<!doctype html>
   <div id="trusted"></div>
 
   <div class="wrap">
-    <h2>종류별로 보기 <span style="color:#6e7681;font-weight:400">· 탭을 누르면 그 유형만, 검색창으로 더 좁히기</span></h2>
+    <h2>종류별로 보기</h2>
     <div class="toolbar">
       <div id="filters" class="filters"></div>
       <input id="search" class="search" type="search" oninput="onSearch(this.value)"
              placeholder="🔎 IP·경로·도구 검색…">
     </div>
-    <h2>실시간 공격 타임라인 <span style="color:#6e7681;font-weight:400">· 최근 공격부터 · 줄을 클릭하면 상세·대응·차단</span></h2>
+    <h2>실시간 타임라인 <span class="h2sub">줄 클릭 → 상세·조치</span></h2>
     <table>
       <thead><tr><th>시각</th><th>IP</th><th>노린 경로</th><th>유형</th><th>상태</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
   </div>
 
-  <footer>LogSentry · 탐지·기록 + 선택적 IP 차단(관리자 권한 시 실제 방화벽 조작) · 침투 흔적·차단 내역은 DB에 영구 저장 · 3초마다 자동 새로고침</footer>
+  <footer>LogSentry · 탐지 · 기록(DB) · 차단 · 3초마다 자동 갱신</footer>
 
   <div id="overlay" onclick="if(event.target===this)closeDetail()">
     <div class="modal">
@@ -1525,14 +1532,10 @@ function openDetail(i){
     +   '<div class="k">도구 지문</div><div class="v ip">' + esc(e.ua || '-') + '</div>'
     +   '</div>'
     + '<div class="rec">'
-    +   '<h4>🤖 대응 추천 (규칙 기반 · 참고용)</h4>'
-    +   '<div class="disc">※ 이 추천은 미리 정한 규칙에 따른 <b>참고용</b>이에요. '
-    +     '항상 맞는 건 아니며 <b>확정 판단이 아닙니다</b> — 실제 차단·조치 전에 '
-    +     '반드시 사람이 로그를 직접 확인하고, 운영 서버는 먼저 경고 모드로 지켜보세요.</div>'
-    +   '<div>' + esc(rec.headline || '') + '</div>'
+    +   '<h4>🤖 대응 추천 <span class="rtag">규칙 기반 · 참고용</span></h4>'
+    +   '<div class="disc">※ <b>참고용</b>이에요 — 확정 판단이 아니니 차단 전에 로그를 직접 확인하세요.</div>'
+    +   (rec.headline ? '<div>' + esc(rec.headline) + '</div>' : '')
     +   '<ul>' + acts + '</ul>'
-    +   (rec.block_cmd ? '<div class="cmd"><button onclick="copyCmd(this)">복사</button>'
-          + esc(rec.block_cmd) + '</div>' : '')
     +   (rec.caution ? '<div class="caution">⚠ ' + esc(rec.caution) + '</div>' : '')
     + '</div>'
     + '<div class="actions">'
@@ -1542,18 +1545,12 @@ function openDetail(i){
           + '<button class="actbtn temp" onclick="doBlock(&#39;' + ipq + '&#39;,&#39;ip&#39;,600)">⏱️ 임시 10분</button>'
           + '<button class="actbtn subnet" onclick="doBlock(&#39;' + ipq + '&#39;,&#39;subnet&#39;,0)">🛡️ 대역 /24</button>')
     +   '<button class="actbtn evic" onclick="doEvidence(&#39;' + ipq + '&#39;)">💾 증거 저장</button>'
-    +   '<button class="actbtn trust" onclick="doTrust(&#39;' + ipq + '&#39;)">✅ 오탐(신뢰)</button>'
-    +   '<div class="ahint">실제 윈도우 방화벽을 조작합니다 · 관리자 권한 필요 · '
-    +     '클릭하면 한 번 더 확인 · 되돌리기(실행 취소) 가능 · 자기자신/사설IP는 거부</div>'
+    +   '<button class="actbtn trust" onclick="doTrust(&#39;' + ipq + '&#39;)">🟢 오탐(신뢰)</button>'
+    +   '<div class="ahint">실제 방화벽 조작(관리자 권한 필요) · 누르면 한 번 더 확인 · 되돌리기 가능</div>'
     + '</div>';
   document.getElementById('overlay').classList.add('on');
 }
 function closeDetail(){ document.getElementById('overlay').classList.remove('on'); }
-function copyCmd(btn){
-  var txt = btn.parentNode.textContent.replace(/^복사(됨)?/, '').trim();
-  if(navigator.clipboard){ navigator.clipboard.writeText(txt); }
-  btn.textContent = '복사됨'; setTimeout(function(){ btn.textContent = '복사'; }, 1200);
-}
 document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closeDetail(); });
 
 function tick(){
