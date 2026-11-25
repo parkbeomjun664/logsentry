@@ -745,5 +745,33 @@ class TestDashboardSecurity(unittest.TestCase):
         self.assertEqual(p["top_ips"][0]["count"], 4)
 
 
+class TestBrand(unittest.TestCase):
+    """[v3.8] 화면 이름(brand) 설정 — 인포패스는 InfoGuard, 공개 저장소는 기본 LogSentry."""
+
+    def setUp(self):
+        self._b = logsentry._BRAND
+
+    def tearDown(self):
+        logsentry._BRAND = self._b
+
+    def test_default_brand_is_logsentry(self):
+        self.assertEqual(logsentry._BRAND, "LogSentry")
+
+    def test_config_sets_brand(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"brand": "InfoGuard"}, f)
+        try:
+            load_config(path)
+            self.assertEqual(logsentry._BRAND, "InfoGuard")
+        finally:
+            os.remove(path)
+
+    def test_dashboard_has_brand_placeholder(self):
+        """화면 템플릿에 자리표시자가 있어 켤 때 이름이 끼워진다."""
+        self.assertIn("__LS_BRAND__", logsentry._DASHBOARD_HTML)
+        self.assertNotIn("LogSentry 실시간", logsentry._DASHBOARD_HTML)  # 제목이 고정 이름이 아님
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

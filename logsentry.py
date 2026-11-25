@@ -66,6 +66,8 @@ _SKIP = ("/favicon.ico", "/robots.txt", "/health")
 # 인증 실패로 볼 상태코드 — 401 비번틀림·403 권한없음·423 계정잠금(무차별의 결정적 증거).
 # 서버마다 로그인 실패를 400·422 등으로 주기도 해서 설정 파일로 넓힐 수 있다.
 _AUTH_STATUSES = (401, 403, 423)
+# 화면에 보일 도구 이름(상황판 제목·헤더·꼬리말). 설정 "brand" 로 회사별로 바꾼다(예: InfoGuard).
+_BRAND = "LogSentry"
 # 신뢰 IP(회사·사내 공유 IP 등) — 경보에서 제외해 오탐을 줄인다. "192.168.10.0/24" 같은 대역도 된다.
 # ⚠ 통신사(LTE) IP 는 여러 사람이 함께 쓰므로 넣지 말 것.
 _TRUSTED_IPS = ()
@@ -89,7 +91,7 @@ def load_config(path):
     코드를 고치지 않고 회사마다 탐침 경로·도구 지문·신뢰 IP·문턱을 바꾸게 한다.
     파일이 없거나 읽기 실패하면 조용히 기본값을 쓴다(도구가 멈추지 않게).
     """
-    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS
+    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS, _BRAND
     thresholds = dict(DEFAULT_THRESHOLDS)
     thresholds["webhook"] = ""   # 알림 웹훅 주소(선택) — 설정 파일로 덮어씀
     if not path or not os.path.exists(path):
@@ -118,6 +120,8 @@ def load_config(path):
     for key, name in (("tool_ua_extra", "_TOOL_UA"), ("probe_paths_extra", "_PROBE_PATHS"), ("skip_extra", "_SKIP")):
         if key in cfg:
             globals()[name] = tuple(globals()[name]) + tuple(x for x in cfg[key] if x not in globals()[name])
+    if "brand" in cfg and str(cfg["brand"]).strip():
+        _BRAND = str(cfg["brand"]).strip()
     if "webhook" in cfg:
         thresholds["webhook"] = cfg["webhook"]
     thresholds.update(cfg.get("thresholds", {}))
@@ -1084,6 +1088,10 @@ def load_history(db_path, limit=200):
         return empty
 
 
+def esc_html(t):
+    return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _host_ok(host):
     """DNS 리바인딩 방지 — Host 의 이름이 localhost 이거나 IP 숫자 주소일 때만 받는다.
 
@@ -1200,7 +1208,7 @@ _DASHBOARD_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LogSentry 실시간 침입 감시</title>
+<title>__LS_BRAND__ 실시간 침입 감시</title>
 <style>
   :root {
     color-scheme: dark;
@@ -1420,7 +1428,7 @@ _DASHBOARD_HTML = """<!doctype html>
 </head>
 <body>
   <header>
-    <h1>🛡️ LogSentry — 실시간 침입 감시</h1>
+    <h1>🛡️ __LS_BRAND__ — 실시간 침입 감시</h1>
     <div class="hr">
       <button class="tbtn" onclick="openHistory()">📋 조치 기록</button>
       <button id="pauseBtn" class="tbtn" onclick="togglePause()">⏸ 일시정지</button>
@@ -1459,7 +1467,7 @@ _DASHBOARD_HTML = """<!doctype html>
     </table>
   </div>
 
-  <footer>LogSentry · 탐지 · 기록(DB) · 차단 · 3초마다 자동 갱신</footer>
+  <footer>__LS_BRAND__ · 탐지 · 기록(DB) · 차단 · 3초마다 자동 갱신</footer>
 
   <div id="overlay" onclick="if(event.target===this)closeDetail()">
     <div class="modal">
@@ -2053,7 +2061,7 @@ def run_dashboard(a):
 
     # 켤 때마다 새로 만드는 비밀 표 — 진짜 화면에만 심어서, 조치 요청이 그 화면에서 왔는지 확인(CSRF 방지)
     token = secrets.token_urlsafe(24)
-    page = _DASHBOARD_HTML.replace("__LS_TOKEN__", token).encode("utf-8")
+    page = _DASHBOARD_HTML.replace("__LS_TOKEN__", token).replace("__LS_BRAND__", esc_html(_BRAND)).encode("utf-8")
     deny = '{"ok":false,"message":"요청 출처를 확인할 수 없어 거절했습니다(상황판 화면에서만 조치할 수 있어요)."}'.encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
