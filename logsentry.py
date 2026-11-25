@@ -1340,6 +1340,9 @@ _DASHBOARD_HTML = """<!doctype html>
   .fbtn.on { background:var(--accent); color:#fff; border-color:var(--accent); }
   .fbtn b { font-weight:700; margin-left:3px; }
   .badge.blk { background:var(--bdg-d-bg); color:var(--bdg-d-fg); margin-left:6px; }
+  .badge.in { background:rgba(88,166,255,.15); color:var(--accent); margin-left:6px; font-weight:600; }
+  td.when { white-space:nowrap; }
+  td.when .day { color:var(--muted); margin-right:4px; }
   /* 차단된 IP 띠(되돌리기 버튼 포함) */
   #blocked { padding:0 20px; }
   .bstrip { background:var(--bdg-d-bg); border:1px solid var(--bdg-d-fg); border-radius:8px;
@@ -1451,7 +1454,7 @@ _DASHBOARD_HTML = """<!doctype html>
     </div>
     <h2>실시간 타임라인 <span class="h2sub">줄 클릭 → 상세·조치</span></h2>
     <table>
-      <thead><tr><th>시각</th><th>IP</th><th>노린 경로</th><th>유형</th><th>상태</th></tr></thead>
+      <thead><tr><th>날짜·시각</th><th>IP</th><th>노린 경로</th><th>유형</th><th>상태</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
   </div>
@@ -1548,7 +1551,7 @@ function renderTop(d){
     return '<div class="prow ' + (x.level === 'alert' ? 'alert' : '') + '" title="클릭=이 IP로 검색" '
       + 'onclick="onSearch(&#39;' + esc(x.ip) + '&#39;, true)">'
       + '<span class="bar" style="width:' + w + '%"></span>'
-      + '<span class="lbl">' + esc(x.ip) + '</span><span class="cnt">' + x.count + '</span></div>';
+      + '<span class="lbl">' + esc(x.ip) + inBadge(x.ip) + '</span><span class="cnt">' + x.count + '</span></div>';
   }).join('') : '<div class="pempty">아직 없음 👍</div>';
   var pathRows = paths.length ? paths.map(function(x){
     var w = Math.max(6, Math.round(x.count / maxP * 100));
@@ -1630,8 +1633,8 @@ function renderRows(){
     var tool = e.tool ? ' <span class="badge watch">도구</span>' : '';
     var blk = (BLOCKED.indexOf(e.ip) >= 0) ? ' <span class="badge blk">차단됨</span>' : '';
     out.push('<tr class="clk ' + cls + '" onclick="openDetail(' + i + ')">'
-      + '<td class="ip">' + esc(e.time) + '</td>'
-      + '<td class="ip">' + esc(e.ip) + blk + '</td>'
+      + '<td class="ip when">' + whenHtml(e) + '</td>'
+      + '<td class="ip">' + esc(e.ip) + inBadge(e.ip) + blk + '</td>'
       + '<td class="path">' + esc(e.path) + '</td>'
       + '<td>' + esc(e.kind) + tool + '</td>'
       + '<td class="st">' + e.status + '</td>'
@@ -1646,8 +1649,32 @@ var LS_TOKEN = '__LS_TOKEN__';   // 서버가 화면을 내줄 때 심는 비밀
 function postJSON(url, obj){
   return fetch(url, {method:'POST', headers:{'Content-Type':'application/json', 'X-LogSentry-Token': LS_TOKEN},
                      body: JSON.stringify(obj)})
-    .then(function(r){ return r.json(); })
+    .then(function(r){
+      if(r.status === 403){   // 상황판이 다시 켜져 비밀 표가 바뀐 경우가 대부분
+        return {ok:false, message:'상황판이 다시 시작돼서 보안 표가 바뀌었어요. Ctrl+Shift+R 로 새로고침한 뒤 다시 눌러주세요.'};
+      }
+      return r.json();
+    })
     .catch(function(){ return {ok:false, message:'요청 실패 — 서버 연결을 확인하세요.'}; });
+}
+// 사내·이 PC 주소인가 — 화면에 '사내' 표시(공격자로 오해하지 않게). 정규식 없이(파이썬 문자열 안이라 역슬래시 회피)
+function isLocalIp(ip){
+  ip = String(ip || '');
+  if(ip === '::1' || ip.indexOf('fe80:') === 0 || ip.indexOf('fc') === 0 || ip.indexOf('fd') === 0){ return true; }
+  var p = ip.split('.');
+  if(p.length !== 4){ return false; }
+  var a = parseInt(p[0], 10), b = parseInt(p[1], 10);
+  return a === 10 || a === 127 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+}
+function inBadge(ip){ return isLocalIp(ip) ? ' <span class="badge in" title="사무실 안 또는 이 PC 주소">사내</span>' : ''; }
+// 타임라인 날짜·시각 — 오늘이면 '오늘', 아니면 '월-일'
+function pad2(n){ return (n < 10 ? '0' : '') + n; }
+function todayStr(){ var d = new Date(); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
+function whenHtml(e){
+  var day = String(e.ts_iso || '').slice(0, 10);
+  if(day.length !== 10){ return esc(e.time); }
+  var label = (day === todayStr()) ? '오늘' : day.slice(5);
+  return '<span class="day">' + esc(label) + '</span>' + esc(e.time);
 }
 function subnet24(ip){ var p = ip.split('.'); return p[0]+'.'+p[1]+'.'+p[2]+'.0/24'; }
 
@@ -1826,7 +1853,7 @@ function openIpList(kind){
       + '<th>탐지 이유</th><th>마지막 공격</th><th></th></tr></thead><tbody>'
       + LISTROWS.map(function(r, i){
           var blk = BLOCKED.indexOf(r.ip) >= 0 ? ' <span class="badge blk">차단됨</span>' : '';
-          return '<tr><td class="mono">' + esc(r.ip) + blk + '</td>'
+          return '<tr><td class="mono">' + esc(r.ip) + inBadge(r.ip) + blk + '</td>'
             + '<td><span class="lv ' + esc(r.level) + '">' + (LEVEL_KO[r.level] || esc(r.level)) + '</span></td>'
             + '<td>' + r.score + '</td><td>' + (r.reqs || 0) + '</td>'
             + '<td class="why">' + esc((r.reasons || []).join(' · ')) + '</td>'
