@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import logsentry
-from logsentry import (LoginTracker, _block_refusal, _is_private, _subnet24,
+from logsentry import (LoginTracker, _block_refusal, _host_ok, _post_allowed, _is_private, _subnet24,
                        _target_rule, _valid_ipv4, alert_key, analyze,
                        analyze_logins, block_ip, build_dashboard_payload,
                        build_timeline, detect_distributed, export_evidence,
@@ -704,6 +704,45 @@ class TestRealTrafficLessons2(unittest.TestCase):
                  + [caddy("9.8.7.6", 1764036010 + i, "GET", f"/api/x{i}", 401, "Mozilla/5.0") for i in range(5)])
         r = {x["ip"]: x for x in analyze([parse_line(l) for l in lines], **DEFAULTS)}
         self.assertIn("없는 주소 3회 · 권한 밖 경로 5회", r["9.8.7.6"]["reasons"])
+
+
+class TestDashboardSecurity(unittest.TestCase):
+    """[v3.7] 상황판 조치 요청 위조(CSRF)·DNS 리바인딩 방지 — 서버 세션 검토에서 발견."""
+
+    T = "s3cr3t-token"
+
+    def test_host_must_be_ip_or_localhost(self):
+        """Host 가 IP 숫자나 localhost 일 때만 — 도메인 이름(리바인딩 수법)은 거절."""
+        for ok in ("127.0.0.1:8790", "localhost:8790", "[::1]:8790", "192.168.10.2:8790", "127.0.0.1"):
+            self.assertTrue(_host_ok(ok), ok)
+        for bad in ("evil.example:8790", "attacker.test", "", None, "127.0.0.1.nip.io:8790"):
+            self.assertFalse(_host_ok(bad), bad)
+
+    def test_post_needs_matching_token(self):
+        """비밀 표(토큰)가 없거나 틀리면 거절, 맞으면 허용."""
+        h = {"Host": "127.0.0.1:8790", "Origin": "http://127.0.0.1:8790"}
+        self.assertEqual(_post_allowed(h, self.T), (False, "token"))
+        self.assertEqual(_post_allowed({**h, "X-LogSentry-Token": "wrong"}, self.T), (False, "token"))
+        self.assertEqual(_post_allowed({**h, "X-LogSentry-Token": self.T}, self.T), (True, ""))
+
+    def test_post_from_other_site_rejected(self):
+        """다른 사이트(Origin 불일치)·null Origin·도메인 Host 는 토큰이 맞아도 거절."""
+        base = {"Host": "127.0.0.1:8790", "X-LogSentry-Token": self.T}
+        self.assertEqual(_post_allowed({**base, "Origin": "https://evil.example"}, self.T)[1], "Origin")
+        self.assertEqual(_post_allowed({**base, "Origin": "null"}, self.T)[1], "Origin")
+        self.assertEqual(_post_allowed({**base, "Host": "evil.example:8790"}, self.T)[1], "Host")
+
+    def test_top_panel_counts_all_requests(self):
+        """Top 패널 숫자는 그 IP의 전체 요청 수 — 의심 헤더만 보낸 공격자도 0 이 아니게."""
+        lines = []
+        for i in range(4):
+            o = json.loads(caddy("27.100.38.10", 1764065760 + i, "POST", "/", 499, "Mozilla/5.0"))
+            o["request"]["headers"]["Next-Action"] = ["x"]
+            lines.append(json.dumps(o))
+        ev = [parse_line(l) for l in lines]
+        p = build_dashboard_payload(analyze(ev, **DEFAULTS), [], build_timeline(ev, 60))
+        self.assertEqual(p["top_ips"][0]["ip"], "27.100.38.10")
+        self.assertEqual(p["top_ips"][0]["count"], 4)
 
 
 if __name__ == "__main__":

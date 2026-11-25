@@ -18,15 +18,18 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import ipaddress
 import json
 import os
 import re
+import secrets
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
@@ -1081,6 +1084,49 @@ def load_history(db_path, limit=200):
         return empty
 
 
+def _host_ok(host):
+    """DNS 리바인딩 방지 — Host 의 이름이 localhost 이거나 IP 숫자 주소일 때만 받는다.
+
+    악성 사이트가 자기 도메인을 127.0.0.1 로 가리키게 해서 상황판을 읽는 수법은
+    언제나 '도메인 이름'을 쓰므로, 이름이 IP 숫자 또는 localhost 가 아니면 거절한다.
+    """
+    h = (host or "").strip()
+    if not h:
+        return False
+    if h.startswith("["):                           # [::1]:8790
+        name = h[1:h.find("]")] if "]" in h else ""
+    elif h.count(":") == 1:                         # 127.0.0.1:8790 / localhost:8790
+        name = h.rsplit(":", 1)[0]
+    else:
+        name = h
+    if name.lower() == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
+def _post_allowed(headers, token):
+    """조치 요청(POST)이 진짜 상황판 화면에서 왔는지 — (허용 여부, 거절 이유).
+
+    ① Host 가 이 PC 주소  ② Origin 이 있으면 Host 와 같은 출처  ③ 화면에 심어 둔 비밀 표(토큰) 일치.
+    다른 사이트는 이 표를 읽을 수 없고(같은 출처 정책), 사용자 지정 헤더도 마음대로 못 붙인다.
+    """
+    host = headers.get("Host") or ""
+    if not _host_ok(host):
+        return False, "Host"
+    origin = headers.get("Origin")
+    if origin is not None:
+        if origin == "null" or urllib.parse.urlsplit(origin).netloc.lower() != host.strip().lower():
+            return False, "Origin"
+    sent = headers.get("X-LogSentry-Token") or ""
+    if not (sent and token and hmac.compare_digest(sent, token)):
+        return False, "token"
+    return True, ""
+
+
 def print_db(path, limit):
     """쌓인 침투 흔적 DB 를 표로 출력 — 상황판을 켜지 않고도 터미널에서 바로 조회."""
     if not os.path.exists(path):
@@ -1126,7 +1172,7 @@ def build_dashboard_payload(results, dist, timeline=None):
         })
     # Top 패널 (GoAccess 식) — 한눈에 '누가·어디를' 가장 많이 노렸는지.
     top_ips = sorted(
-        ({"ip": r["ip"], "count": r["nf"] + r["auth"] + r["probes"],
+        ({"ip": r["ip"], "count": r.get("reqs") or (r["nf"] + r["auth"] + r["probes"]),
           "level": r["level"], "score": r["score"]} for r in rows),
         key=lambda x: (x["count"], x["score"]), reverse=True)[:6]
     top_paths = [{"path": p, "count": c}
@@ -1596,8 +1642,9 @@ function renderRows(){
 }
 
 // ── 조치 공통 도구: 서버 요청 / 한 번 더 묻는 확인창 / 되돌리기 토스트 ──
+var LS_TOKEN = '__LS_TOKEN__';   // 서버가 화면을 내줄 때 심는 비밀 표(조치 요청 확인용)
 function postJSON(url, obj){
-  return fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+  return fetch(url, {method:'POST', headers:{'Content-Type':'application/json', 'X-LogSentry-Token': LS_TOKEN},
                      body: JSON.stringify(obj)})
     .then(function(r){ return r.json(); })
     .catch(function(){ return {ok:false, message:'요청 실패 — 서버 연결을 확인하세요.'}; });
@@ -1977,16 +2024,28 @@ def run_dashboard(a):
                     state["payload"] = payload
             time.sleep(a.scan_interval)
 
+    # 켤 때마다 새로 만드는 비밀 표 — 진짜 화면에만 심어서, 조치 요청이 그 화면에서 왔는지 확인(CSRF 방지)
+    token = secrets.token_urlsafe(24)
+    page = _DASHBOARD_HTML.replace("__LS_TOKEN__", token).encode("utf-8")
+    deny = '{"ok":false,"message":"요청 출처를 확인할 수 없어 거절했습니다(상황판 화면에서만 조치할 수 있어요)."}'.encode("utf-8")
+
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")   # 브라우저가 옛 화면 캐시 못하게
+            self.send_header("X-Frame-Options", "DENY")      # 남의 페이지 안에 끼워 클릭 유도 방지
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):   # noqa: N802 (http.server 가 정한 이름)
+            if not _host_ok(self.headers.get("Host")):   # DNS 리바인딩으로 읽어 가기 방지
+                self._send(403, deny, "application/json; charset=utf-8")
+                return
             if self.path.startswith("/api/alerts"):
                 with lock:
                     resp = dict(state["payload"])                 # 얕은 복사 후
@@ -2004,8 +2063,7 @@ def run_dashboard(a):
                 body = json.dumps(load_history(a.db), ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
             elif self.path == "/" or self.path.startswith("/?"):
-                self._send(200, _DASHBOARD_HTML.encode("utf-8"),
-                           "text/html; charset=utf-8")
+                self._send(200, page, "text/html; charset=utf-8")
             else:
                 self._send(404, b"not found", "text/plain; charset=utf-8")
 
@@ -2013,6 +2071,11 @@ def run_dashboard(a):
             if self.path not in ("/api/block", "/api/unblock", "/api/evidence",
                                  "/api/trust", "/api/untrust"):
                 self._send(404, b"not found", "text/plain; charset=utf-8")
+                return
+            allowed, why = _post_allowed(self.headers, token)
+            if not allowed:
+                print(f"⚠ 조치 요청 거절({why}) — 출처 확인 실패")
+                self._send(403, deny, "application/json; charset=utf-8")
                 return
             try:
                 n = int(self.headers.get("Content-Length") or 0)
