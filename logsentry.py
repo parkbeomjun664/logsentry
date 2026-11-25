@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -60,8 +61,18 @@ _SKIP = ("/favicon.ico", "/robots.txt", "/health")
 # 인증 실패로 볼 상태코드 — 401 비번틀림·403 권한없음·423 계정잠금(무차별의 결정적 증거).
 # 서버마다 로그인 실패를 400·422 등으로 주기도 해서 설정 파일로 넓힐 수 있다.
 _AUTH_STATUSES = (401, 403, 423)
-# 신뢰 IP(회사·사내 공유 IP 등) — 경보에서 제외해 오탐을 줄인다
+# 신뢰 IP(회사·사내 공유 IP 등) — 경보에서 제외해 오탐을 줄인다. "192.168.10.0/24" 같은 대역도 된다.
+# ⚠ 통신사(LTE) IP 는 여러 사람이 함께 쓰므로 넣지 말 것.
 _TRUSTED_IPS = ()
+# 로그인 경로(설정 시) — 여기서 난 401/403/423 만 '로그인 실패'로 센다. 다른 경로의 401 은
+# '권한 밖 경로 훑기(정찰)'로 분류한다. 로그인 안 한 요청에 전부 401 을 주는 API 에서
+# 스캐너가 '무차별 대입'으로 잘못 보이는 것을 막는다. 비어 있으면 모든 경로의 401 이 로그인 실패.
+_AUTH_PATHS = ()
+# 의심 요청 헤더(소문자) — 한 번만 와도 위험. Next-Action = Next.js 서버 액션 헤더,
+# React2Shell(CVE-2025-55182) 류 원격 코드 실행 공격에 쓰인다. 서버 액션을 실제로 쓰는 앱이면 비울 것.
+_SUSPICIOUS_HEADERS = ("next-action",)
+# 표준 HTTP 메서드 — 이 밖의 메서드(EXDW 등)는 스캐너의 서버 종류 떠보기로 본다
+_STD_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 # 문턱 기본값 — logsentry.json 의 "thresholds" 로 덮어쓸 수 있다
 DEFAULT_THRESHOLDS = {"window": 60, "probe": 5, "auth": 5, "rate": 20,
                       "score": 6, "dist_ip": 5}
@@ -73,7 +84,7 @@ def load_config(path):
     코드를 고치지 않고 회사마다 탐침 경로·도구 지문·신뢰 IP·문턱을 바꾸게 한다.
     파일이 없거나 읽기 실패하면 조용히 기본값을 쓴다(도구가 멈추지 않게).
     """
-    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES
+    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS
     thresholds = dict(DEFAULT_THRESHOLDS)
     thresholds["webhook"] = ""   # 알림 웹훅 주소(선택) — 설정 파일로 덮어씀
     if not path or not os.path.exists(path):
@@ -94,6 +105,10 @@ def load_config(path):
         _TRUSTED_IPS = tuple(cfg["trusted_ips"])
     if "auth_statuses" in cfg:
         _AUTH_STATUSES = tuple(cfg["auth_statuses"])
+    if "auth_paths" in cfg:
+        _AUTH_PATHS = tuple(cfg["auth_paths"])
+    if "suspicious_headers" in cfg:
+        _SUSPICIOUS_HEADERS = tuple(str(h).lower() for h in cfg["suspicious_headers"])
     if "webhook" in cfg:
         thresholds["webhook"] = cfg["webhook"]
     thresholds.update(cfg.get("thresholds", {}))
@@ -143,7 +158,8 @@ def _parse_caddy(o):
     status = o.get("status")
     if not ip or status is None:
         return None
-    ua = (req.get("headers") or {}).get("User-Agent") or ""
+    headers = req.get("headers") or {}
+    ua = headers.get("User-Agent") or ""
     if isinstance(ua, list):
         ua = ua[0] if ua else ""
     raw_ts = o.get("ts")
@@ -162,6 +178,7 @@ def _parse_caddy(o):
         "path": str(req.get("uri") or "").split("?")[0],
         "status": int(status),
         "ua": str(ua),
+        "hdrs": tuple(str(k).lower() for k in headers),   # 헤더 이름만(값은 안 씀) — 의심 헤더 탐지용
     }
 
 
@@ -204,22 +221,90 @@ def is_probe_path(path):
     return any(path.startswith(p) for p in _PROBE_PATHS)
 
 
+_TRUSTED_CACHE = {"key": None, "exact": frozenset(), "nets": ()}
+
+
+def _is_trusted(ip):
+    """신뢰 IP 인가 — 정확한 주소 또는 대역(CIDR, 예: 192.168.10.0/24)."""
+    t = _TRUSTED_IPS
+    if not t or not ip:
+        return False
+    if _TRUSTED_CACHE["key"] is not t:          # 목록이 바뀌었을 때만 다시 해석
+        exact, nets = set(), []
+        for x in t:
+            x = str(x).strip()
+            if "/" in x:
+                try:
+                    nets.append(ipaddress.ip_network(x, strict=False))
+                except ValueError:
+                    pass
+            else:
+                exact.add(x)
+        _TRUSTED_CACHE.update(key=t, exact=frozenset(exact), nets=tuple(nets))
+    if ip in _TRUSTED_CACHE["exact"]:
+        return True
+    if _TRUSTED_CACHE["nets"]:
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(a in n for n in _TRUSTED_CACHE["nets"])
+    return False
+
+
+def _on_auth_path(path):
+    return any(path.startswith(p) for p in _AUTH_PATHS)
+
+
+def _is_auth_fail(e):
+    """로그인 실패인가 — 로그인 경로를 지정했으면 그 경로의 401/403/423 만."""
+    return e["status"] in _AUTH_STATUSES and (not _AUTH_PATHS or _on_auth_path(e["path"]))
+
+
+def _is_offlimits(e):
+    """권한 밖 경로 훑기 — 로그인 경로가 지정됐고, 그 밖의 경로에서 401/403/423."""
+    return bool(_AUTH_PATHS) and e["status"] in _AUTH_STATUSES and not _on_auth_path(e["path"])
+
+
+def _is_nf(e):
+    """정찰성 실패 — 없는 주소(404) 또는 권한 밖 경로(위)."""
+    return e["status"] == 404 or _is_offlimits(e)
+
+
+def _odd_flags(e):
+    """의심 헤더·비표준 메서드 — 한 번만 와도 의심할 요청의 특징 목록."""
+    flags = []
+    hdrs = e.get("hdrs") or ()
+    for h in _SUSPICIOUS_HEADERS:
+        if h in hdrs:
+            flags.append(f"의심 헤더 {h}")
+    m = (e.get("method") or "").upper()
+    if m and m not in _STD_METHODS:
+        flags.append(f"비표준 메서드 {m}")
+    return flags
+
+
 def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, score_threshold):
     agg = defaultdict(lambda: {
         "reqs": 0, "nf": 0, "auth": 0, "paths": set(), "probes": 0,
         "tool": False, "first": None, "last": None, "times": [],
+        "odd": 0, "odd_kinds": set(),
     })
     for e in events:
-        if e["ip"] in _TRUSTED_IPS:   # 신뢰 IP 는 경보 대상에서 제외(오탐 감소)
+        if _is_trusted(e["ip"]):   # 신뢰 IP 는 경보 대상에서 제외(오탐 감소)
             continue
         if any(e["path"].startswith(s) for s in _SKIP):
             continue
         d = agg[e["ip"]]
         d["reqs"] += 1
-        if e["status"] == 404:
+        if _is_nf(e):              # 없는 주소 · 권한 밖 경로(정찰)
             d["nf"] += 1
-        if e["status"] in _AUTH_STATUSES:
+        if _is_auth_fail(e):       # 로그인 실패
             d["auth"] += 1
+        flags = _odd_flags(e)      # 의심 헤더 · 비표준 메서드 — 한 번만 와도 위험
+        if flags:
+            d["odd"] += 1
+            d["odd_kinds"].update(flags)
         d["paths"].add(e["path"])
         if is_probe_path(e["path"]):
             d["probes"] += 1
@@ -236,7 +321,8 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
         burst = _max_in_window(sorted(d["times"]), window)
         # P5 종합 점수
         score = (d["nf"] + 2 * d["auth"] + 2 * d["probes"]
-                 + (2 if d["tool"] else 0) + (3 if burst >= rate_threshold else 0))
+                 + (2 if d["tool"] else 0) + (3 if burst >= rate_threshold else 0)
+                 + score_threshold * d["odd"])   # 의심 헤더·메서드는 한 건으로 경보 문턱
 
         reasons = []
         if d["nf"] >= probe_threshold:
@@ -249,6 +335,8 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
             reasons.append(f"탐침경로 {d['probes']}개")
         if d["tool"]:
             reasons.append("도구 UA")
+        if d["odd"]:
+            reasons.append(f"의심 헤더·메서드 {d['odd']}회 ({', '.join(sorted(d['odd_kinds']))})")
 
         # 개별 신호가 저마다 문턱을 못 넘어도, 서로 다른 종류의 의심 신호가 '겹치고'
         # 종합 점수(P5)가 문턱을 넘으면 경보한다. 정상 사용자는 '없는 주소 뒤지기'와
@@ -318,10 +406,9 @@ def detect_distributed(events, window, ip_threshold):
     신뢰 IP 는 제외하고, 404 는 정상 소음(_SKIP) 경로를 뺀다.
     """
     auth_hits = [(e["ts"], e["ip"]) for e in events
-                 if e["ts"] and e["ip"] not in _TRUSTED_IPS
-                 and e["status"] in _AUTH_STATUSES]
+                 if e["ts"] and not _is_trusted(e["ip"]) and _is_auth_fail(e)]
     nf_hits = [(e["ts"], e["ip"]) for e in events
-               if e["ts"] and e["ip"] not in _TRUSTED_IPS and e["status"] == 404
+               if e["ts"] and not _is_trusted(e["ip"]) and _is_nf(e)
                and not any(e["path"].startswith(s) for s in _SKIP)]
     results = []
     auth_ips = _max_distinct_in_window(auth_hits, window)
@@ -347,7 +434,7 @@ def analyze_logins(login_events, window, spray_threshold, account_threshold,
     신뢰 IP 는 제외한다.
     """
     fails = [e for e in login_events
-             if not e.get("success") and e.get("ts") and e.get("ip") not in _TRUSTED_IPS]
+             if not e.get("success") and e.get("ts") and not _is_trusted(e.get("ip"))]
     results = []
 
     # 스프레이: IP 별로 '그 IP 가 노린 서로 다른 계정 수'(시간창 안 최대)
@@ -535,18 +622,27 @@ def _iso(dt):
 
 def _is_suspicious(e):
     """이 요청 한 건이 '수상한가' — 없는주소(404)·인증거부·탐침경로·도구 지문 중 하나라도."""
-    return (e["status"] == 404 or e["status"] in _AUTH_STATUSES
+    return (_is_nf(e) or _is_auth_fail(e) or bool(_odd_flags(e))
             or is_probe_path(e["path"]) or is_tool(e["ua"]))
 
 
 def _event_kind(e):
-    """수상한 요청 한 건에 붙일 유형 이름(우선순위: 탐침 > 인증거부 > 없는주소 > 도구)."""
+    """수상한 요청 한 건에 붙일 유형 이름
+    (우선순위: 의심 헤더 > 탐침 > 비표준 메서드 > 인증거부 > 없는주소 > 권한 밖 경로 > 도구).
+    이상한 메서드로 온 401 은 로그인 시도가 아니라 스캐너라서 인증거부보다 앞에 둔다."""
+    flags = _odd_flags(e)
+    if any(f.startswith("의심 헤더") for f in flags):
+        return "의심 헤더"
     if is_probe_path(e["path"]):
         return "탐침경로"
-    if e["status"] in _AUTH_STATUSES:
+    if flags:
+        return "비표준 메서드"
+    if _is_auth_fail(e):
         return "인증거부"
     if e["status"] == 404:
         return "없는 주소"
+    if _is_offlimits(e):
+        return "권한 밖 경로"
     if is_tool(e["ua"]):
         return "도구 접근"
     return "요청"
@@ -554,7 +650,7 @@ def _event_kind(e):
 
 def _severity(kind):
     """유형 → 심각도(위험/경고). 탐침·인증거부는 명백히 악의적 → 위험."""
-    return "위험" if kind in ("탐침경로", "인증거부") else "경고"
+    return "위험" if kind in ("탐침경로", "인증거부", "의심 헤더") else "경고"
 
 
 def recommend(ip, path, status, ua, kind):
@@ -574,6 +670,19 @@ def recommend(ip, path, status, ua, kind):
         actions.append("같은 IP의 반복 실패면 IP 차단, 한 계정에 여러 IP면 그 계정 비밀번호 강제 변경.")
         if status == 423:
             actions.append("상태 423=이미 계정 잠금 발동 → 무차별 대입의 결정적 증거. 우선 대응.")
+    elif kind == "의심 헤더":
+        headline = ("프레임워크 취약점 공격 시도(예: Next.js 'Next-Action' 헤더를 쓰는 React2Shell 류). "
+                    "원격 코드 실행을 노리는 위험한 요청.")
+        actions.append("웹 프레임워크(Next.js/React) 버전이 해당 취약점이 고쳐진 버전인지 즉시 확인.")
+        actions.append("앱이 그 기능(서버 액션)을 쓰지 않으면 앞단(Caddy/nginx)에서 이 헤더가 있는 요청을 거절.")
+        actions.append("같은 IP의 다른 요청과 서버의 파일·프로세스 변경 여부를 점검(침해 흔적 확인).")
+    elif kind == "비표준 메서드":
+        headline = "표준이 아닌 HTTP 메서드 — 스캐너가 서버 종류를 떠볼 때 흔히 씀."
+        actions.append("웹서버가 표준 메서드 외에는 거절(405)하는지 확인. 반복되면 스캐너로 보고 관찰·차단.")
+    elif kind == "권한 밖 경로":
+        headline = "로그인 없이 보호된 경로를 훑음(정찰). 무엇이 있는지 떠보는 단계."
+        actions.append("단발이면 소음일 수 있으나, 같은 IP가 여러 경로를 훑으면 스캐너로 보고 관찰·차단.")
+        actions.append("API가 아닌 경로까지 401로 답하면 404로 돌려 공격 표면을 줄이는 것도 방법.")
     elif kind == "없는 주소":
         headline = "없는 주소 훑기(정찰). 서버 구조를 떠보는 초기 단계일 수 있음."
         actions.append("단발이면 소음일 수 있으나, 같은 IP가 반복하면 스캐너로 보고 관찰·차단.")
@@ -616,7 +725,7 @@ def build_timeline(events, limit=60):
     신뢰 IP·정상 소음(_SKIP)은 뺀다. timestamp() 로 정렬해 aware/naive 혼용 오류를 피한다.
     """
     susp = [e for e in events
-            if e["ip"] not in _TRUSTED_IPS
+            if not _is_trusted(e["ip"])
             and not any(e["path"].startswith(s) for s in _SKIP)
             and _is_suspicious(e)]
     susp.sort(key=lambda e: e["ts"].timestamp() if e["ts"] else float("-inf"), reverse=True)
@@ -662,7 +771,7 @@ def store_events(conn, events):
     now = datetime.now().isoformat(timespec="seconds")
     saved = 0
     for e in events:
-        if e["ip"] in _TRUSTED_IPS:
+        if _is_trusted(e["ip"]):
             continue
         if any(e["path"].startswith(s) for s in _SKIP):
             continue

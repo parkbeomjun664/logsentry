@@ -599,5 +599,74 @@ class TestCaddyLog(unittest.TestCase):
         self.assertIsNone(parse_line('[1, 2, 3]'))
 
 
+class TestRealTrafficLessons(unittest.TestCase):
+    """[v3.5] 인포패스 첫 관찰(11/25)에서 배운 것 — React2Shell 놓침, 8081 401 오분류, 대역 신뢰."""
+
+    def setUp(self):
+        self._b = (logsentry._TRUSTED_IPS, logsentry._AUTH_PATHS, logsentry._SUSPICIOUS_HEADERS)
+
+    def tearDown(self):
+        logsentry._TRUSTED_IPS, logsentry._AUTH_PATHS, logsentry._SUSPICIOUS_HEADERS = self._b
+
+    def _react2shell(self, ip="27.100.38.10", n=4):
+        out = []
+        for i in range(n):
+            o = json.loads(caddy(ip, 1764065760 + i, "POST", "/", 499, "Mozilla/5.0"))
+            o["request"]["headers"]["Next-Action"] = ["x"]
+            o["request"]["headers"]["Content-Type"] = ["multipart/form-data; boundary=----x"]
+            out.append(json.dumps(o))
+        return [parse_line(l) for l in out]
+
+    def test_react2shell_single_request_is_alert(self):
+        """Next-Action 헤더 요청은 한 번만 와도 '위험' 경보 — 오늘 실제로 놓친 공격."""
+        ev = self._react2shell(n=1)
+        r = {x["ip"]: x for x in analyze(ev, **DEFAULTS)}
+        self.assertEqual(r["27.100.38.10"]["level"], "alert")
+        self.assertTrue(any("의심 헤더" in s for s in r["27.100.38.10"]["reasons"]))
+        tl = build_timeline(ev, 60)
+        self.assertEqual(tl[0]["kind"], "의심 헤더")
+        self.assertEqual(tl[0]["severity"], "위험")
+
+    def test_suspicious_headers_can_be_turned_off(self):
+        """서버 액션을 실제로 쓰는 앱이면 설정으로 끌 수 있다(오탐 방지)."""
+        logsentry._SUSPICIOUS_HEADERS = ()
+        r = {x["ip"]: x for x in analyze(self._react2shell(n=1), **DEFAULTS)}
+        self.assertNotIn("27.100.38.10", r)
+
+    def test_nonstandard_method_flagged(self):
+        """EXDW 같은 비표준 메서드(nmap 서비스 탐지)는 의심으로 잡는다."""
+        e = parse_line(nginx("35.210.235.16", "11:45:00", "EXDW", "/", 401, "Mozilla/5.0"))
+        self.assertEqual(build_timeline([e], 60)[0]["kind"], "비표준 메서드")
+        r = {x["ip"]: x for x in analyze([e], **DEFAULTS)}
+        self.assertIn("35.210.235.16", r)
+
+    def test_auth_paths_separates_login_failure_from_scanning(self):
+        """로그인 경로를 지정하면: 로그인 401=인증거부, 다른 경로 401=권한 밖 경로(정찰)."""
+        logsentry._AUTH_PATHS = ("/api/v1/auth/login",)
+        login = parse_line(caddy("1.2.3.4", 1764036000, "POST", "/api/v1/auth/login", 401, "Mozilla/5.0"))
+        scan = parse_line(caddy("5.6.7.8", 1764036000, "GET", "/mcp", 401, "Mozilla/5.0"))
+        kinds = {r["ip"]: r["kind"] for r in build_timeline([login, scan], 60)}
+        self.assertEqual(kinds["1.2.3.4"], "인증거부")
+        self.assertEqual(kinds["5.6.7.8"], "권한 밖 경로")
+
+    def test_distributed_401_scan_is_scan_not_bruteforce(self):
+        """7개 IP가 /mcp 등에 401 → 로그인 경로 지정 시 '분산 스캔'으로(무차별 아님) — Infrawatch 사례."""
+        logsentry._AUTH_PATHS = ("/api/v1/auth/login",)
+        ev = [parse_line(caddy(f"203.0.113.{i}", 1764034780 + i * 0.2, "GET", "/mcp", 401, "Mozilla/5.0"))
+              for i in range(1, 8)]
+        kinds = [d["kind"] for d in detect_distributed(ev, 60, 5)]
+        self.assertTrue(any("스캔" in k for k in kinds), kinds)
+        self.assertFalse(any("무차별" in k for k in kinds), kinds)
+
+    def test_trusted_cidr(self):
+        """신뢰 IP에 대역(CIDR)을 쓸 수 있다 — 대역 안은 제외, 밖은 그대로 탐지."""
+        logsentry._TRUSTED_IPS = ("192.168.10.0/24", "::1")
+        inside = [parse_line(nginx("192.168.10.5", f"09:00:0{i}", "GET", p, 404, "sqlmap")) for i, p in enumerate(PROBES)]
+        outside = [parse_line(nginx("192.168.11.5", f"09:00:0{i}", "GET", p, 404, "sqlmap")) for i, p in enumerate(PROBES)]
+        r = {x["ip"]: x for x in analyze(inside + outside, **DEFAULTS)}
+        self.assertNotIn("192.168.10.5", r)
+        self.assertIn("192.168.11.5", r)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
