@@ -668,5 +668,43 @@ class TestRealTrafficLessons(unittest.TestCase):
         self.assertIn("192.168.11.5", r)
 
 
+class TestRealTrafficLessons2(unittest.TestCase):
+    """[v3.6] 개선판 적용 결과에서 나온 보완 — Nmap 고정 탐침, 덧붙이기 설정, 표시 분리."""
+
+    def setUp(self):
+        self._b = (logsentry._PROBE_PATHS, logsentry._TOOL_UA, logsentry._SKIP, logsentry._AUTH_PATHS)
+
+    def tearDown(self):
+        logsentry._PROBE_PATHS, logsentry._TOOL_UA, logsentry._SKIP, logsentry._AUTH_PATHS = self._b
+
+    def test_nmap_fixed_probe_is_probe(self):
+        """Nmap 서비스 탐지 고정 문자열(/nice ports,/Trinity.txt.bak)은 기본으로 탐침 — 71.6.243.52 사례."""
+        e = parse_line(caddy("71.6.243.52", 1764049190, "GET", "/nice%20ports%2C/Trinity.txt.bak", 401, ""))
+        self.assertEqual(build_timeline([e], 60)[0]["kind"], "탐침경로")
+
+    def test_extra_keys_append_not_replace(self):
+        """*_extra 설정은 기본 목록을 지우지 않고 덧붙인다."""
+        cfg = {"probe_paths_extra": ["/secret-admin"], "skip_extra": ["/_next/static/"]}
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        try:
+            load_config(path)
+            self.assertIn("/secret-admin", logsentry._PROBE_PATHS)
+            self.assertIn("/.env", logsentry._PROBE_PATHS)          # 기본 목록 유지
+            self.assertIn("/_next/static/", logsentry._SKIP)
+            self.assertIn("/favicon.ico", logsentry._SKIP)
+        finally:
+            os.remove(path)
+
+    def test_reason_splits_404_and_offlimits(self):
+        """경보 이유에 '없는 주소'와 '권한 밖 경로'를 나눠 표시한다(섞인 숫자로 헷갈리지 않게)."""
+        logsentry._AUTH_PATHS = ("/api/v1/auth/login",)
+        lines = ([caddy("9.8.7.6", 1764036000 + i, "GET", f"/nope{i}", 404, "Mozilla/5.0") for i in range(3)]
+                 + [caddy("9.8.7.6", 1764036010 + i, "GET", f"/api/x{i}", 401, "Mozilla/5.0") for i in range(5)])
+        r = {x["ip"]: x for x in analyze([parse_line(l) for l in lines], **DEFAULTS)}
+        self.assertIn("없는 주소 3회 · 권한 밖 경로 5회", r["9.8.7.6"]["reasons"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

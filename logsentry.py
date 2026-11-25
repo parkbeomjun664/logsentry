@@ -55,7 +55,9 @@ _TOOL_UA = ("curl", "python-requests", "python-urllib", "wget", "go-http",
 # 흔한 탐침 경로(있으면 가중)
 _PROBE_PATHS = ("/.env", "/.git", "/wp-login", "/wp-admin", "/phpmyadmin",
                 "/admin", "/actuator", "/config", "/backup", "/.aws",
-                "/server-status", "/.ssh", "/vendor", "/shell")
+                "/server-status", "/.ssh", "/vendor", "/shell",
+                # Nmap 서비스 탐지가 늘 보내는 고정 문자열(/nice ports,/Trinity.txt.bak)
+                "/nice%20ports", "/nice ports")
 # 정상 소음(제외)
 _SKIP = ("/favicon.ico", "/robots.txt", "/health")
 # 인증 실패로 볼 상태코드 — 401 비번틀림·403 권한없음·423 계정잠금(무차별의 결정적 증거).
@@ -109,6 +111,10 @@ def load_config(path):
         _AUTH_PATHS = tuple(cfg["auth_paths"])
     if "suspicious_headers" in cfg:
         _SUSPICIOUS_HEADERS = tuple(str(h).lower() for h in cfg["suspicious_headers"])
+    # *_extra 키는 기본 목록을 덮지 않고 '덧붙인다' — 덮어쓰기 키 다음에 처리(기본 탐침·소음·도구 목록을 그대로 두고 한두 개만 추가할 때)
+    for key, name in (("tool_ua_extra", "_TOOL_UA"), ("probe_paths_extra", "_PROBE_PATHS"), ("skip_extra", "_SKIP")):
+        if key in cfg:
+            globals()[name] = tuple(globals()[name]) + tuple(x for x in cfg[key] if x not in globals()[name])
     if "webhook" in cfg:
         thresholds["webhook"] = cfg["webhook"]
     thresholds.update(cfg.get("thresholds", {}))
@@ -288,7 +294,7 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
     agg = defaultdict(lambda: {
         "reqs": 0, "nf": 0, "auth": 0, "paths": set(), "probes": 0,
         "tool": False, "first": None, "last": None, "times": [],
-        "odd": 0, "odd_kinds": set(),
+        "odd": 0, "odd_kinds": set(), "off": 0,
     })
     for e in events:
         if _is_trusted(e["ip"]):   # 신뢰 IP 는 경보 대상에서 제외(오탐 감소)
@@ -299,6 +305,8 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
         d["reqs"] += 1
         if _is_nf(e):              # 없는 주소 · 권한 밖 경로(정찰)
             d["nf"] += 1
+            if _is_offlimits(e):
+                d["off"] += 1      # 표시할 때 '없는 주소'와 나눠 보여주려고 따로 센다
         if _is_auth_fail(e):       # 로그인 실패
             d["auth"] += 1
         flags = _odd_flags(e)      # 의심 헤더 · 비표준 메서드 — 한 번만 와도 위험
@@ -326,7 +334,9 @@ def analyze(events, window, probe_threshold, auth_threshold, rate_threshold, sco
 
         reasons = []
         if d["nf"] >= probe_threshold:
-            reasons.append(f"없는 주소 {d['nf']}회")
+            nf404 = d["nf"] - d["off"]
+            parts = ([f"없는 주소 {nf404}회"] if nf404 else []) + ([f"권한 밖 경로 {d['off']}회"] if d["off"] else [])
+            reasons.append(" · ".join(parts))
         if d["auth"] >= auth_threshold:
             reasons.append(f"인증거부 {d['auth']}회")
         if burst >= rate_threshold:
