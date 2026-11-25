@@ -773,5 +773,41 @@ class TestBrand(unittest.TestCase):
         self.assertNotIn("LogSentry 실시간", logsentry._DASHBOARD_HTML)  # 제목이 고정 이름이 아님
 
 
+class TestBrandLogo(unittest.TestCase):
+    """[v3.9] 로고 설정(brand_logo) — 파일/ data URI, 없으면 기본 방패, 공개 저장소엔 로고 미포함."""
+
+    def setUp(self): self._b = logsentry._BRAND_LOGO
+    def tearDown(self): logsentry._BRAND_LOGO = self._b
+
+    def test_default_is_shield(self):
+        logsentry._BRAND_LOGO = ""
+        self.assertIn("brand-emoji", logsentry._logo_html())
+
+    def test_data_uri_passthrough(self):
+        logsentry._BRAND_LOGO = "data:image/png;base64,AAAA"
+        h = logsentry._logo_html()
+        self.assertIn("brand-logo-img", h)
+        self.assertIn("data:image/png;base64,AAAA", h)
+
+    def test_file_path_embedded(self):
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.write(fd, bytes([0x89, 0x50, 0x4E, 0x47]) + b"logo-bytes")
+        os.close(fd)
+        try:
+            logsentry._BRAND_LOGO = path
+            self.assertIn("data:image/png;base64,", logsentry._logo_html())
+        finally:
+            os.remove(path)
+
+    def test_bad_path_falls_back(self):
+        logsentry._BRAND_LOGO = os.path.join("no_such_dir_xyz", "missing.png")
+        self.assertIn("brand-emoji", logsentry._logo_html())
+
+    def test_public_html_has_no_company_logo(self):
+        """공개 템플릿엔 회사 로고(data URI)가 없다 — 기본 자리표시자만."""
+        self.assertIn("__LS_LOGO__", logsentry._DASHBOARD_HTML)
+        self.assertNotIn("data:image", logsentry._DASHBOARD_HTML)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

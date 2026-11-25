@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hmac
 import ipaddress
 import json
@@ -68,6 +69,9 @@ _SKIP = ("/favicon.ico", "/robots.txt", "/health")
 _AUTH_STATUSES = (401, 403, 423)
 # 화면에 보일 도구 이름(상황판 제목·헤더·꼬리말). 설정 "brand" 로 회사별로 바꾼다(예: InfoGuard).
 _BRAND = "LogSentry"
+# 화면 로고(선택) — 설정 "brand_logo" = 이미지 파일 경로 또는 data: URI. 비우면 기본 방패.
+# 회사 로고는 설정 파일로만 넣는다(공개 저장소엔 안 올라감).
+_BRAND_LOGO = ""
 # 신뢰 IP(회사·사내 공유 IP 등) — 경보에서 제외해 오탐을 줄인다. "192.168.10.0/24" 같은 대역도 된다.
 # ⚠ 통신사(LTE) IP 는 여러 사람이 함께 쓰므로 넣지 말 것.
 _TRUSTED_IPS = ()
@@ -91,7 +95,7 @@ def load_config(path):
     코드를 고치지 않고 회사마다 탐침 경로·도구 지문·신뢰 IP·문턱을 바꾸게 한다.
     파일이 없거나 읽기 실패하면 조용히 기본값을 쓴다(도구가 멈추지 않게).
     """
-    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS, _BRAND
+    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS, _BRAND, _BRAND_LOGO
     thresholds = dict(DEFAULT_THRESHOLDS)
     thresholds["webhook"] = ""   # 알림 웹훅 주소(선택) — 설정 파일로 덮어씀
     if not path or not os.path.exists(path):
@@ -122,6 +126,8 @@ def load_config(path):
             globals()[name] = tuple(globals()[name]) + tuple(x for x in cfg[key] if x not in globals()[name])
     if "brand" in cfg and str(cfg["brand"]).strip():
         _BRAND = str(cfg["brand"]).strip()
+    if "brand_logo" in cfg:
+        _BRAND_LOGO = str(cfg["brand_logo"]).strip()
     if "webhook" in cfg:
         thresholds["webhook"] = cfg["webhook"]
     thresholds.update(cfg.get("thresholds", {}))
@@ -1088,6 +1094,25 @@ def load_history(db_path, limit=200):
         return empty
 
 
+def _logo_html():
+    """헤더 로고 HTML — 설정 brand_logo(파일 경로 또는 data: URI)가 있으면 이미지, 없으면 기본 방패."""
+    v = _BRAND_LOGO
+    shield = '<span class="brand-emoji">🛡️</span>'
+    if not v:
+        return shield
+    if not v.startswith("data:"):
+        try:
+            with open(v, "rb") as f:
+                raw = f.read()
+            ext = os.path.splitext(v)[1].lower().lstrip(".")
+            mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "svg": "image/svg+xml", "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
+            v = f"data:{mime};base64," + base64.b64encode(raw).decode()
+        except Exception:  # noqa: BLE001
+            return shield
+    return '<img class="brand-logo-img" alt="" src="' + v.replace('"', "") + '">'
+
+
 def esc_html(t):
     return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -1239,7 +1264,10 @@ _DASHBOARD_HTML = """<!doctype html>
          font-family:"Segoe UI",system-ui,sans-serif; }
   header { padding:16px 20px; border-bottom:1px solid var(--border);
            display:flex; align-items:center; justify-content:space-between; }
-  header h1 { font-size:18px; margin:0; font-weight:600; }
+  header h1 { font-size:18px; margin:0; font-weight:600; display:flex; align-items:center; gap:10px; }
+  .brand-emoji { font-size:20px; }
+  .brand-logo-img { height:30px; background:#fff; border-radius:7px; padding:3px 8px;
+                    box-shadow:0 0 0 1px rgba(0,0,0,.08); flex:none; }
   .hr { display:flex; align-items:center; gap:14px; }
   .tbtn { background:var(--btn-bg); color:var(--btn-fg); border:1px solid var(--border2);
           border-radius:6px; padding:5px 11px; font-size:12px; cursor:pointer; }
@@ -1428,7 +1456,7 @@ _DASHBOARD_HTML = """<!doctype html>
 </head>
 <body>
   <header>
-    <h1>🛡️ __LS_BRAND__ — 실시간 침입 감시</h1>
+    <h1>__LS_LOGO__ <span>__LS_BRAND__ — 실시간 침입 감시</span></h1>
     <div class="hr">
       <button class="tbtn" onclick="openHistory()">📋 조치 기록</button>
       <button id="pauseBtn" class="tbtn" onclick="togglePause()">⏸ 일시정지</button>
@@ -2061,7 +2089,9 @@ def run_dashboard(a):
 
     # 켤 때마다 새로 만드는 비밀 표 — 진짜 화면에만 심어서, 조치 요청이 그 화면에서 왔는지 확인(CSRF 방지)
     token = secrets.token_urlsafe(24)
-    page = _DASHBOARD_HTML.replace("__LS_TOKEN__", token).replace("__LS_BRAND__", esc_html(_BRAND)).encode("utf-8")
+    page = (_DASHBOARD_HTML.replace("__LS_TOKEN__", token)
+            .replace("__LS_LOGO__", _logo_html())
+            .replace("__LS_BRAND__", esc_html(_BRAND)).encode("utf-8"))
     deny = '{"ok":false,"message":"요청 출처를 확인할 수 없어 거절했습니다(상황판 화면에서만 조치할 수 있어요)."}'.encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
