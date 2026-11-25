@@ -554,5 +554,50 @@ class TestHistoryScreen(unittest.TestCase):
         self.assertEqual(p["alerts"][0]["reqs"], len(PROBES))
 
 
+def caddy(ip, ts, method, uri, status, ua, remote=None):
+    """Caddy 접근 로그(JSON) 한 줄을 실제 모양 그대로 만든다."""
+    return json.dumps({
+        "level": "info", "ts": ts, "logger": "http.log.access.log0", "msg": "handled request",
+        "request": {"remote_ip": remote or ip, "remote_port": "51234", "client_ip": ip,
+                    "proto": "HTTP/1.1", "method": method, "host": "infopath.iptime.org:3000",
+                    "uri": uri, "headers": {"User-Agent": [ua], "Authorization": ["REDACTED"]}},
+        "bytes_read": 0, "duration": 0.0012, "size": 512, "status": status,
+    })
+
+
+class TestCaddyLog(unittest.TestCase):
+    """[v3.4] Caddy 접근 로그 읽기 — 인포패스 MES 앞단(Caddy) 로그를 바로 탐지에 쓰기 위해."""
+
+    def test_parses_nested_fields(self):
+        """겹친 구조에서 IP·방식·경로(쿼리 제거)·상태·도구 지문·시각을 꺼낸다."""
+        e = parse_line(caddy("211.45.1.2", 1764036000.5, "GET", "/api/files/1?token=REDACTED", 404, "sqlmap/1.7"))
+        self.assertEqual(e["ip"], "211.45.1.2")
+        self.assertEqual(e["method"], "GET")
+        self.assertEqual(e["path"], "/api/files/1")
+        self.assertEqual(e["status"], 404)
+        self.assertEqual(e["ua"], "sqlmap/1.7")
+        self.assertIsNotNone(e["ts"])
+        self.assertEqual(round(e["ts"].timestamp(), 1), 1764036000.5)
+
+    def test_prefers_client_ip_over_remote_ip(self):
+        """client_ip(진짜 IP)를 remote_ip 보다 먼저 쓴다."""
+        e = parse_line(caddy("211.45.1.2", 1764036000, "GET", "/", 200, "Mozilla/5.0", remote="192.168.10.1"))
+        self.assertEqual(e["ip"], "211.45.1.2")
+
+    def test_caddy_lines_are_detected_as_attack(self):
+        """Caddy 로그만으로도 탐침 스캐너를 경보로 잡는다(기존 탐지 규칙 그대로)."""
+        lines = [caddy("211.45.1.2", 1764036000 + i, "GET", p, 404, "sqlmap/1.7") for i, p in enumerate(PROBES)]
+        events = [e for e in (parse_line(l) for l in lines) if e]
+        self.assertEqual(len(events), len(PROBES))
+        r = {x["ip"]: x for x in analyze(events, **DEFAULTS)}
+        self.assertEqual(r["211.45.1.2"]["level"], "alert")
+
+    def test_non_access_json_is_ignored(self):
+        """request 가 없거나 깨진 JSON 줄은 조용히 건너뛴다."""
+        self.assertIsNone(parse_line('{"level":"info","ts":1764036000,"msg":"server running"}'))
+        self.assertIsNone(parse_line('{"request": {"uri": "/"}, "status": 200}'))   # IP 없음
+        self.assertIsNone(parse_line('[1, 2, 3]'))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

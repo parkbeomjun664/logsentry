@@ -131,11 +131,49 @@ def _parse_nginx(line):
     }
 
 
+def _parse_caddy(o):
+    """Caddy 접근 로그(JSON, 값이 request 안에 겹쳐 있는 구조) → 공통 형태.
+
+    {"ts":1764000000.12,"request":{"client_ip":..,"remote_ip":..,"method":..,"uri":..,
+     "headers":{"User-Agent":["..."]}},"status":404, ...}
+    client_ip 를 먼저 쓴다(신뢰 프록시 설정 시 진짜 IP), 없으면 remote_ip.
+    """
+    req = o.get("request") or {}
+    ip = req.get("client_ip") or req.get("remote_ip")
+    status = o.get("status")
+    if not ip or status is None:
+        return None
+    ua = (req.get("headers") or {}).get("User-Agent") or ""
+    if isinstance(ua, list):
+        ua = ua[0] if ua else ""
+    raw_ts = o.get("ts")
+    ts = None
+    try:
+        if isinstance(raw_ts, (int, float)):
+            ts = datetime.fromtimestamp(raw_ts, tz=timezone.utc).astimezone()   # 유닉스 초 → 이 PC 시간대
+        elif isinstance(raw_ts, str) and raw_ts:
+            ts = datetime.fromisoformat(raw_ts)                                 # time_format iso8601 인 경우
+    except (ValueError, OverflowError, OSError):
+        ts = None
+    return {
+        "ip": ip,
+        "ts": ts,
+        "method": req.get("method") or "",
+        "path": str(req.get("uri") or "").split("?")[0],
+        "status": int(status),
+        "ua": str(ua),
+    }
+
+
 def _parse_json(line):
     try:
         o = json.loads(line)
     except ValueError:
         return None
+    if not isinstance(o, dict):
+        return None
+    if isinstance(o.get("request"), dict):   # Caddy 접근 로그
+        return _parse_caddy(o)
     # 흔한 필드 이름들을 두루 받아 준다
     ip = o.get("remote_addr") or o.get("ip") or o.get("client_ip")
     status = o.get("status")
