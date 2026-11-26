@@ -17,7 +17,7 @@ from logsentry import (LoginTracker, _block_refusal, _host_ok, _post_allowed, _i
                        _target_rule, _valid_ipv4, alert_key, analyze,
                        analyze_logins, block_ip, build_dashboard_payload,
                        build_timeline, detect_distributed, export_evidence,
-                       delete_logs, load_config, load_deleted, load_history, load_trusted, purge_logs, restore_logs, open_db, parse_line,
+                       delete_logs, delete_many, load_config, load_deleted, load_history, load_trusted, purge_logs, restore_logs, open_db, parse_line,
                        recent_intrusions, recommend, send_webhook, store_events,
                        trust_ip, unblock_ip, untrust_ip)
 
@@ -877,6 +877,20 @@ class TestLogDeleteRestore(unittest.TestCase):
             conn = open_db(p)
             total = conn.execute("SELECT COUNT(*) FROM intrusion").fetchone()[0]; conn.close()
             self.assertEqual(total, 3)                          # 영구 삭제라 행 자체가 사라짐
+        finally:
+            os.remove(p)
+
+    def test_delete_many_selected(self):
+        p = self._db()
+        try:
+            conn = open_db(p); tl = recent_intrusions(conn); conn.close()
+            picks = [{"ts": r["ts_iso"], "ip": r["ip"], "path": r["path"], "status": r["status"]} for r in tl[:3]]
+            r = delete_many(p, picks, 1)
+            self.assertEqual(r["count"], 3)
+            conn = open_db(p); self.assertEqual(len(recent_intrusions(conn)), 2); conn.close()
+            self.assertEqual(len(load_deleted(p)["rows"]), 3)
+            delete_many(p, picks, 0)   # 복구
+            conn = open_db(p); self.assertEqual(len(recent_intrusions(conn)), 5); conn.close()
         finally:
             os.remove(p)
 

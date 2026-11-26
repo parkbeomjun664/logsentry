@@ -1156,6 +1156,35 @@ def delete_logs(db_path, data):
     return _set_deleted(db_path, data, 1)
 
 
+def delete_many(db_path, items, flag=1):
+    """선택한 여러 건을 한 번에 삭제(flag=1) 또는 복구(flag=0). 바뀐 건수 반환."""
+    if not db_path or not os.path.exists(db_path):
+        return {"ok": False, "count": 0, "message": "DB 없음"}
+    rows = [i for i in (items or []) if isinstance(i, dict)][:3000]   # 과도한 요청 방지
+    if not rows:
+        return {"ok": False, "count": 0, "message": "선택한 항목이 없습니다."}
+    try:
+        conn = open_db(db_path)
+        now = datetime.now().isoformat(timespec="seconds") if flag else None
+        n = 0
+        for it in rows:
+            cur = conn.execute(
+                "UPDATE intrusion SET deleted=?, deleted_at=?"
+                " WHERE ts=? AND ip=? AND path=? AND status=? AND COALESCE(deleted,0)=?",
+                [flag, now, it.get("ts") or "", it.get("ip") or "", it.get("path") or "",
+                 int(it.get("status") or 0), 0 if flag else 1])
+            n += cur.rowcount
+        conn.commit()
+        conn.close()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "count": 0, "message": f"처리 실패: {e}"}
+    _audit(db_path, "", "log_delete" if flag else "log_restore", "ok",
+           f"선택 {n}건 {'삭제' if flag else '복구'}")
+    return {"ok": True, "count": n,
+            "message": (f"선택한 {n}건을 삭제했습니다(삭제함에서 복구 가능)." if flag
+                        else f"선택한 {n}건을 복구했습니다.")}
+
+
 def restore_logs(db_path, data):
     if data.get("scope") == "all":            # 삭제함 전체 복구
         data = {"ip": "*", "scope": "allrows"}
@@ -1625,6 +1654,21 @@ _DASHBOARD_HTML = """<!doctype html>
   .kv .v.ip, .kv .v.path { font-family:ui-monospace,Consolas,monospace; }
   /* 상단 버튼(헤더) 간격 */
   .hr { gap:8px; }
+  /* 여러 건 선택 삭제 */
+  .chkcol { width:34px; text-align:center; padding-left:12px; }
+  .rchk, #selall { width:15px; height:15px; cursor:pointer; accent-color:var(--accent); vertical-align:middle; }
+  tr.sel td { background:rgba(88,166,255,.10) !important; }
+  tr.sel td:first-child { border-left-color:var(--accent); }
+  .selbar { display:none; }
+  .selbar.on { display:flex; align-items:center; gap:10px; margin:0 4px 10px;
+               background:var(--panel); border:1px solid var(--accent); border-radius:9px;
+               padding:8px 13px; font-size:13px; }
+  .selbar b { color:var(--accent); }
+  .selbtn { margin-left:2px; border:1px solid var(--border2); background:var(--btn-bg); color:var(--btn-fg);
+            border-radius:7px; padding:5px 12px; font-size:12.5px; font-weight:600; cursor:pointer; }
+  .selbtn:hover { border-color:var(--accent); }
+  .selbtn.del { background:var(--danger); color:#fff; border-color:var(--danger); }
+  .selbtn.del:hover { opacity:.9; }
 </style>
 </head>
 <body>
@@ -1664,8 +1708,11 @@ _DASHBOARD_HTML = """<!doctype html>
     </div>
     <h2>실시간 타임라인 <span class="h2sub">줄 클릭 → 상세·조치</span>
       <button class="tlbtn" onclick="doDeleteAll()">🗑 전체 삭제</button></h2>
+    <div id="selbar" class="selbar"></div>
     <table>
-      <thead><tr><th>날짜·시각</th><th>IP</th><th>노린 경로</th><th>유형</th><th>상태</th></tr></thead>
+      <thead><tr>
+        <th class="chkcol"><input type="checkbox" id="selall" onclick="toggleSelAll(this)" title="보이는 줄 전체 선택"></th>
+        <th>날짜·시각</th><th>IP</th><th>노린 경로</th><th>유형</th><th>상태</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
   </div>
@@ -1846,7 +1893,10 @@ function renderRows(){
     var kpill = '<span class="kpill ' + cls + '"><span class="sdot"></span>' + esc(e.kind) + '</span>';
     var tool = e.tool ? ' <span class="badge watch">도구</span>' : '';
     var blk = (BLOCKED.indexOf(e.ip) >= 0) ? ' <span class="badge blk">차단됨</span>' : '';
-    out.push('<tr class="clk ' + cls + '" onclick="openDetail(' + i + ')">'
+    var chk = SEL[rowKey(e)] ? ' checked' : '';
+    out.push('<tr class="clk ' + cls + (chk ? ' sel' : '') + '" onclick="openDetail(' + i + ')">'
+      + '<td class="chkcol"><input type="checkbox" class="rchk"' + chk
+      + ' onclick="event.stopPropagation();toggleSel(' + i + ')"></td>'
       + '<td class="ip when">' + whenHtml(e) + '</td>'
       + '<td class="ip">' + esc(e.ip) + inBadge(e.ip) + blk + '</td>'
       + '<td class="path">' + esc(e.path) + '</td>'
@@ -1855,7 +1905,74 @@ function renderRows(){
       + '</tr>');
   }
   document.getElementById('rows').innerHTML = out.length ? out.join('')
-    : '<tr><td colspan="5" class="empty">' + (SEARCH ? '검색 결과가 없습니다' : '해당 종류의 공격 기록이 없습니다 👍') + '</td></tr>';
+    : '<tr><td colspan="6" class="empty">' + (SEARCH ? '검색 결과가 없습니다' : '해당 종류의 공격 기록이 없습니다 👍') + '</td></tr>';
+  renderSelBar();
+  syncSelAll();
+}
+
+// ── 여러 건 선택 삭제 ── (선택은 줄 고유키로 기억 → 새로고침돼도 체크 유지)
+var SEL = {};
+function rowKey(e){ return (e.ip || '') + '|' + (e.ts_iso || '') + '|' + (e.path || '') + '|' + e.status; }
+function selItems(){
+  var out = [];
+  for(var k in SEL){ var e = SEL[k]; out.push({ts: e.ts_iso || '', ip: e.ip, path: e.path, status: e.status}); }
+  return out;
+}
+function selCount(){ return Object.keys(SEL).length; }
+function toggleSel(i){
+  var e = LAST[i]; if(!e){ return; }
+  var k = rowKey(e);
+  if(SEL[k]){ delete SEL[k]; } else { SEL[k] = e; }
+  renderRows();   // 선택 표시·선택바·전체선택 체크를 한 번에 갱신
+}
+function toggleSelAll(box){
+  // 지금 '보이는'(필터·검색 통과) 줄 전체를 선택/해제
+  var any = box.checked;
+  for(var i = 0; i < LAST.length; i++){
+    var e = LAST[i];
+    if(FILTER !== '전체' && e.kind !== FILTER){ continue; }
+    if(!matchSearch(e)){ continue; }
+    var k = rowKey(e);
+    if(any){ SEL[k] = e; } else { delete SEL[k]; }
+  }
+  renderRows();
+}
+function syncSelAll(){
+  var box = document.getElementById('selall'); if(!box){ return; }
+  var vis = 0, sel = 0;
+  for(var i = 0; i < LAST.length; i++){
+    var e = LAST[i];
+    if(FILTER !== '전체' && e.kind !== FILTER){ continue; }
+    if(!matchSearch(e)){ continue; }
+    vis++; if(SEL[rowKey(e)]){ sel++; }
+  }
+  box.checked = vis > 0 && sel === vis;
+  box.indeterminate = sel > 0 && sel < vis;
+}
+function clearSel(){ SEL = {}; renderRows(); }
+function renderSelBar(){
+  var n = selCount();
+  var el = document.getElementById('selbar');
+  if(!n){ el.className = 'selbar'; el.innerHTML = ''; return; }
+  el.className = 'selbar on';
+  el.innerHTML = '<span><b>' + n + '건</b> 선택됨</span>'
+    + '<button class="selbtn del" onclick="doDeleteSelected()">🗑 선택 삭제</button>'
+    + '<button class="selbtn" onclick="clearSel()">선택 해제</button>';
+  syncSelAll();
+}
+function doDeleteSelected(){
+  var items = selItems(); if(!items.length){ return; }
+  askConfirm({title:'선택 삭제', confirmLabel:'삭제', danger:true, twoStep:false,
+    lines:[items.length + '건을 목록에서 지웁니다.', '삭제함으로 옮겨져 복구할 수 있어요.']})
+    .then(function(ok){
+      if(!ok){ return; }
+      postJSON('/api/log/delete_many', {items: items}).then(function(res){
+        SEL = {};
+        showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''),
+          res.ok ? function(){ postJSON('/api/log/restore_many', {items: items}).then(function(){ tick(); }); } : null);
+        afterAction();
+      });
+    });
 }
 
 // ── 조치 공통 도구: 서버 요청 / 한 번 더 묻는 확인창 / 되돌리기 토스트 ──
@@ -2423,7 +2540,8 @@ def run_dashboard(a):
         def do_POST(self):   # noqa: N802 — 조치 버튼(차단/해제/증거/신뢰)이 부르는 창구
             if self.path not in ("/api/block", "/api/unblock", "/api/evidence",
                                  "/api/trust", "/api/untrust",
-                                 "/api/log/delete", "/api/log/restore", "/api/log/purge"):
+                                 "/api/log/delete", "/api/log/restore", "/api/log/purge",
+                                 "/api/log/delete_many", "/api/log/restore_many"):
                 self._send(404, b"not found", "text/plain; charset=utf-8")
                 return
             allowed, why = _post_allowed(self.headers, token)
@@ -2475,6 +2593,10 @@ def run_dashboard(a):
                 res = restore_logs(a.db, data)
             elif self.path == "/api/log/purge":
                 res = purge_logs(a.db, data)
+            elif self.path == "/api/log/delete_many":
+                res = delete_many(a.db, data.get("items"), 1)
+            elif self.path == "/api/log/restore_many":
+                res = delete_many(a.db, data.get("items"), 0)
             else:                                   # /api/evidence
                 res = export_evidence(a.db, ip)
             self._send(200, json.dumps(res, ensure_ascii=False).encode("utf-8"),
