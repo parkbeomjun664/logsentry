@@ -2207,7 +2207,8 @@ function viewRow(i){
 }
 
 // ── 조치 기록 화면: 지금 차단 중 · 신뢰 IP · 조치 이력 ──
-var ACT_KO = {block:'차단', unblock:'해제', trust:'신뢰(오탐)', untrust:'신뢰 해제', evidence:'증거 저장'};
+var ACT_KO = {block:'차단', unblock:'해제', trust:'신뢰(오탐)', untrust:'신뢰 해제', evidence:'증거 저장',
+              log_delete:'기록 삭제', log_restore:'기록 복구', log_purge:'영구 삭제'};
 var RES_KO = {ok:'성공', failed:'실패', refused:'거부'};
 var HTABS = [
   {name:'전체',      f:function(a){ return true; }},
@@ -2215,7 +2216,8 @@ var HTABS = [
   {name:'해제',      f:function(a){ return a.action === 'unblock' || a.action === 'untrust'; }},
   {name:'신뢰',      f:function(a){ return a.action === 'trust'; }},
   {name:'증거',      f:function(a){ return a.action === 'evidence'; }},
-  {name:'실패·거부', f:function(a){ return a.result !== 'ok'; }}
+  {name:'실패·거부', f:function(a){ return a.result !== 'ok'; }},
+  {name:'삭제·복구', f:function(a){ return String(a.action).indexOf('log_') === 0; }}
 ];
 function openHistory(){
   HISTORY_OPEN = true;
