@@ -785,6 +785,13 @@ def open_db(path):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS trusted("
         "ip TEXT PRIMARY KEY, added_at TEXT)")
+    # 소프트 삭제 — 화면에서 지워도 바로 안 없애고 '삭제함'으로 옮겨 복구할 수 있게.
+    # 이미 쓰던 DB 에도 칸을 더한다(없을 때만). 기존 행은 deleted=0(안 지움).
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(intrusion)")}
+    if "deleted" not in cols:
+        conn.execute("ALTER TABLE intrusion ADD COLUMN deleted INTEGER DEFAULT 0")
+    if "deleted_at" not in cols:
+        conn.execute("ALTER TABLE intrusion ADD COLUMN deleted_at TEXT")
     conn.commit()
     return conn
 
@@ -817,7 +824,7 @@ def recent_intrusions(conn, limit=60):
     """DB 에서 최근 침투 흔적을 시간 순(최근 먼저)으로 꺼내 타임라인 모양으로."""
     cur = conn.execute(
         "SELECT ts, ip, path, status, method, ua, kind FROM intrusion"
-        " ORDER BY ts DESC LIMIT ?", (limit,))
+        " WHERE COALESCE(deleted,0)=0 ORDER BY ts DESC LIMIT ?", (limit,))
     out = []
     for ts, ip, path, status, method, ua, kind in cur.fetchall():
         try:
@@ -1092,6 +1099,105 @@ def load_history(db_path, limit=200):
         return {"blocked": blocked, "trusted": trusted, "audit": audit, "db": True}
     except Exception:  # noqa: BLE001
         return empty
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 공격 내역 삭제·복구 (소프트 삭제) — 화면에서 지워도 '삭제함'으로 옮겨 복구 가능.
+#   scope="one": 한 건(ts·ip·path·status 로 특정)  ·  scope="ip": 그 IP 전체
+# ──────────────────────────────────────────────────────────────────────────
+def _intrusion_filter(data):
+    """요청 → (SQL 조건, 값들). 한 건이면 네 값 모두, IP 전체면 ip 만."""
+    ip = (data.get("ip") or "").strip()
+    if not ip:
+        return None, None
+    if data.get("scope") == "ip":
+        return "ip=?", [ip]
+    return "ts=? AND ip=? AND path=? AND status=?", [
+        data.get("ts") or "", ip, data.get("path") or "", int(data.get("status") or 0)]
+
+
+def _set_deleted(db_path, data, flag):
+    """공격 내역을 삭제 표시(flag=1) 또는 복구(flag=0). 바뀐 건수를 돌려준다."""
+    where, params = _intrusion_filter(data)
+    if not db_path or not where:
+        return {"ok": False, "count": 0, "message": "대상이 올바르지 않습니다."}
+    try:
+        conn = open_db(db_path)
+        now = datetime.now().isoformat(timespec="seconds") if flag else None
+        cur = conn.execute(
+            f"UPDATE intrusion SET deleted=?, deleted_at=? WHERE {where} AND COALESCE(deleted,0)=?",
+            [flag, now] + params + [0 if flag else 1])
+        conn.commit()
+        n = cur.rowcount
+        conn.close()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "count": 0, "message": f"처리 실패: {e}"}
+    act = "log_delete" if flag else "log_restore"
+    _audit(db_path, (data.get("ip") or ""), act, "ok", f"{n}건 {'삭제' if flag else '복구'}")
+    return {"ok": True, "count": n,
+            "message": (f"{n}건을 삭제했습니다(삭제함에서 복구 가능)." if flag
+                        else f"{n}건을 복구했습니다.")}
+
+
+def delete_logs(db_path, data):
+    return _set_deleted(db_path, data, 1)
+
+
+def restore_logs(db_path, data):
+    if data.get("scope") == "all":            # 삭제함 전체 복구
+        data = {"ip": "*", "scope": "allrows"}
+    if data.get("scope") == "allrows":
+        if not db_path:
+            return {"ok": False, "count": 0, "message": "DB 없음"}
+        try:
+            conn = open_db(db_path)
+            cur = conn.execute("UPDATE intrusion SET deleted=0, deleted_at=NULL WHERE deleted=1")
+            conn.commit(); n = cur.rowcount; conn.close()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "count": 0, "message": f"처리 실패: {e}"}
+        _audit(db_path, "", "log_restore", "ok", f"{n}건 전체 복구")
+        return {"ok": True, "count": n, "message": f"{n}건을 모두 복구했습니다."}
+    return _set_deleted(db_path, data, 0)
+
+
+def purge_logs(db_path, data):
+    """삭제함을 영구 삭제(복구 불가). scope='all' 이면 삭제함 비우기."""
+    if not db_path or not os.path.exists(db_path):
+        return {"ok": False, "count": 0, "message": "DB 없음"}
+    try:
+        conn = open_db(db_path)
+        if data.get("scope") == "all":
+            cur = conn.execute("DELETE FROM intrusion WHERE deleted=1")
+        else:
+            where, params = _intrusion_filter(data)
+            if not where:
+                conn.close()
+                return {"ok": False, "count": 0, "message": "대상이 올바르지 않습니다."}
+            cur = conn.execute(f"DELETE FROM intrusion WHERE {where} AND deleted=1", params)
+        conn.commit(); n = cur.rowcount; conn.close()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "count": 0, "message": f"처리 실패: {e}"}
+    _audit(db_path, (data.get("ip") or ""), "log_purge", "ok", f"{n}건 영구삭제")
+    return {"ok": True, "count": n, "message": f"{n}건을 영구 삭제했습니다(복구 불가)."}
+
+
+def load_deleted(db_path, limit=300):
+    """'삭제함' 화면용 — 삭제 표시된 공격 내역(삭제 시각 최근 먼저)."""
+    out = {"rows": [], "db": bool(db_path)}
+    if not db_path or not os.path.exists(db_path):
+        return out
+    try:
+        conn = open_db(db_path)
+        rows = conn.execute(
+            "SELECT ts, ip, path, status, kind, severity, deleted_at FROM intrusion"
+            " WHERE deleted=1 ORDER BY deleted_at DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+    except Exception:  # noqa: BLE001
+        return out
+    out["rows"] = [{"ts": ts or "", "ip": ip or "", "path": path or "", "status": status,
+                    "kind": kind or "", "severity": severity or "", "deleted_at": da or ""}
+                   for ts, ip, path, status, kind, severity, da in rows]
+    return out
 
 
 def _logo_html():
@@ -1401,6 +1507,7 @@ _DASHBOARD_HTML = """<!doctype html>
   .actbtn.temp:hover { border-color:var(--warn); color:var(--warn); }
   .actbtn.subnet:hover { border-color:#8957e5; color:#a371f7; }
   .actbtn.trust:hover { border-color:var(--accent); color:var(--accent); }
+  .actbtn.del:hover { border-color:var(--danger); color:var(--danger); }
   .actbtn:hover { opacity:.9; }
   .ahint { font-size:11.5px; color:var(--faint); line-height:1.45; width:100%; margin-top:4px; }
   /* 한 번 더 묻는 확인창 */
@@ -1459,6 +1566,7 @@ _DASHBOARD_HTML = """<!doctype html>
     <h1>__LS_LOGO__ <span>__LS_BRAND__ — 실시간 침입 감시</span></h1>
     <div class="hr">
       <button class="tbtn" onclick="openHistory()">📋 조치 기록</button>
+      <button class="tbtn" onclick="openDeleted()">🗑 삭제함</button>
       <button id="pauseBtn" class="tbtn" onclick="togglePause()">⏸ 일시정지</button>
       <button id="themeBtn" class="tbtn" onclick="toggleTheme()">☀ 밝게</button>
       <span id="status"><span class="dot"></span>연결 중…</span>
@@ -1553,6 +1661,8 @@ var PAUSED = false;     // 자동 새로고침 일시정지
 var ALERTS = [];        // IP별 탐지 결과(단계·점수·이유) — 위 숫자 칸 클릭 시 목록
 var LISTROWS = [];      // 지금 띄운 IP 목록(버튼은 인덱스로 참조 — 문자열을 onclick 에 넣지 않음)
 var HISTORY_OPEN = false, HIST = null, HFILTER = 0;
+var DETAIL = null;                 // 지금 상세창에 띄운 공격 한 건(삭제에 사용)
+var DELETED_OPEN = false, DELROWS = [];   // 삭제함 화면 상태
 
 function render(d){
   document.getElementById('attempt').textContent = d.attempt_count;
@@ -1852,9 +1962,11 @@ function showModal(titleHtml, bodyHtml, wide){
   document.getElementById('m-body').innerHTML = bodyHtml;
   document.getElementById('overlay').classList.add('on');
 }
-// 조치 후: 기록 화면을 보고 있었으면 그 화면을 새로 그리고, 아니면 창을 닫는다
+// 조치 후: 보고 있던 화면(삭제함/기록)을 새로 그리고, 아니면 창을 닫는다
 function afterAction(){
-  if(HISTORY_OPEN){ openHistory(); } else { closeDetail(); }
+  if(DELETED_OPEN){ openDeleted(); }
+  else if(HISTORY_OPEN){ openHistory(); }
+  else { closeDetail(); }
   tick();
 }
 function fmtTs(s){ return s ? String(s).replace('T', ' ').slice(0, 19) : '—'; }
@@ -1981,7 +2093,7 @@ function renderHistory(){
 
 function openDetail(i){
   var e = LAST[i]; if(!e) return;
-  HISTORY_OPEN = false;
+  HISTORY_OPEN = false; DELETED_OPEN = false; DETAIL = e;
   document.querySelector('#overlay .modal').classList.remove('wide');
   var sc = e.severity === '위험' ? 'danger' : 'warn';
   var rec = e.rec || {};
@@ -2014,11 +2126,102 @@ function openDetail(i){
           + '<button class="actbtn subnet" onclick="doBlock(&#39;' + ipq + '&#39;,&#39;subnet&#39;,0)">🛡️ 대역 /24</button>')
     +   '<button class="actbtn evic" onclick="doEvidence(&#39;' + ipq + '&#39;)">💾 증거 저장</button>'
     +   '<button class="actbtn trust" onclick="doTrust(&#39;' + ipq + '&#39;)">🟢 오탐(신뢰)</button>'
-    +   '<div class="ahint">실제 방화벽 조작(관리자 권한 필요) · 누르면 한 번 더 확인 · 되돌리기 가능</div>'
+    +   '<button class="actbtn del" onclick="doDeleteLog()">🗑 기록 삭제</button>'
+    +   '<button class="actbtn del" onclick="doDeleteLogIp()">🗑 이 IP 기록 전체</button>'
+    +   '<div class="ahint">삭제해도 삭제함으로 옮겨져 복구할 수 있어요 · 조치는 누르면 한 번 더 확인</div>'
     + '</div>';
   document.getElementById('overlay').classList.add('on');
 }
-function closeDetail(){ HISTORY_OPEN = false; document.getElementById('overlay').classList.remove('on'); }
+function closeDetail(){ HISTORY_OPEN = false; DELETED_OPEN = false; document.getElementById('overlay').classList.remove('on'); }
+
+// 공격 내역 삭제(소프트) — 상세창의 '기록 삭제' 버튼. DETAIL(지금 띄운 한 건)을 쓴다.
+function doDeleteLog(){
+  var e = DETAIL; if(!e){ return; }
+  askConfirm({title:'기록 삭제', confirmLabel:'삭제', danger:false, twoStep:false,
+    lines:[esc(e.ip) + ' 의 이 기록 1건을 목록에서 지웁니다.', '삭제함으로 옮겨져 언제든 복구할 수 있어요.']})
+    .then(function(ok){
+      if(!ok){ return; }
+      postJSON('/api/log/delete', {scope:'one', ip:e.ip, ts:e.ts_iso || '', path:e.path, status:e.status})
+        .then(function(res){ showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''),
+          res.ok ? function(){ postJSON('/api/log/restore', {scope:'one', ip:e.ip, ts:e.ts_iso || '', path:e.path, status:e.status}).then(function(){ tick(); }); } : null);
+          afterAction(); });
+    });
+}
+function doDeleteLogIp(){
+  var e = DETAIL; if(!e){ return; }
+  askConfirm({title:'이 IP 기록 전체 삭제', confirmLabel:'전체 삭제', danger:true, twoStep:false,
+    lines:[esc(e.ip) + ' 의 공격 기록을 모두 목록에서 지웁니다.', '삭제함에서 되돌릴 수 있어요.']})
+    .then(function(ok){
+      if(!ok){ return; }
+      postJSON('/api/log/delete', {scope:'ip', ip:e.ip}).then(function(res){
+        showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''),
+          res.ok ? function(){ postJSON('/api/log/restore', {scope:'ip', ip:e.ip}).then(function(){ tick(); }); } : null);
+        afterAction();
+      });
+    });
+}
+
+// ── 삭제함 화면: 지운 공격 내역을 보고 복구/영구삭제 ──
+function openDeleted(){
+  DELETED_OPEN = true; HISTORY_OPEN = false;
+  showModal('🗑 삭제함', '<div class="hempty">불러오는 중…</div>', true);
+  fetch('/api/deleted', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){ DELROWS = d.rows || []; renderDeleted(); })
+    .catch(function(){ document.getElementById('m-body').innerHTML = '<div class="hempty">불러오지 못했어요.</div>'; });
+}
+function renderDeleted(){
+  var rows = DELROWS;
+  var head = '🗑 삭제함 <span class="cnt" style="font-weight:400;color:var(--faint)">' + rows.length + '건</span>';
+  if(rows.length){
+    head += ' <button class="lbtn" onclick="delRestoreAll()">전체 복구</button>'
+         +  ' <button class="lbtn" onclick="delPurgeAll()">삭제함 비우기(영구)</button>';
+  }
+  document.getElementById('m-title').innerHTML = head;
+  var out;
+  if(!rows.length){
+    out = '<div class="hempty">삭제한 기록이 없어요. (타임라인에서 줄 클릭 → 🗑 기록 삭제)</div>';
+  } else {
+    out = '<div class="disc">삭제한 기록은 여기 보관돼요. <b>복구</b>하면 다시 타임라인에 나타나고, <b>영구 삭제</b>하면 되돌릴 수 없어요.</div>'
+      + '<div class="hscroll"><table class="ltab"><thead><tr><th>삭제 시각</th><th>공격 시각</th><th>IP</th><th>노린 경로</th><th>유형</th><th></th></tr></thead><tbody>'
+      + rows.map(function(r, i){
+          return '<tr><td class="mono">' + esc(fmtTs(r.deleted_at)) + '</td><td class="mono">' + esc(fmtTs(r.ts)) + '</td>'
+            + '<td class="mono">' + esc(r.ip) + '</td><td class="det">' + esc(r.path) + '</td>'
+            + '<td>' + esc(r.kind) + '</td>'
+            + '<td style="white-space:nowrap"><button class="lbtn" onclick="delRestore(' + i + ')">복구</button> '
+            + '<button class="lbtn" onclick="delPurgeOne(' + i + ')">영구삭제</button></td></tr>';
+        }).join('') + '</tbody></table></div>';
+  }
+  document.getElementById('m-body').innerHTML = out;
+}
+function delRestore(i){
+  var r = DELROWS[i]; if(!r){ return; }
+  postJSON('/api/log/restore', {scope:'one', ip:r.ip, ts:r.ts, path:r.path, status:r.status})
+    .then(function(res){ showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''), null); afterAction(); });
+}
+function delRestoreAll(){
+  askConfirm({title:'전체 복구', confirmLabel:'복구', danger:false, twoStep:false,
+    lines:['삭제함의 모든 기록을 타임라인으로 되돌립니다.']}).then(function(ok){
+    if(!ok){ return; }
+    postJSON('/api/log/restore', {scope:'all'}).then(function(res){ showUndo((res.ok?'✅ ':'⚠ ')+(res.message||''), null); afterAction(); });
+  });
+}
+function delPurgeOne(i){
+  var r = DELROWS[i]; if(!r){ return; }
+  askConfirm({title:'영구 삭제', confirmLabel:'영구 삭제', danger:true, twoStep:true,
+    lines:[esc(r.ip) + ' 의 이 기록을 완전히 지웁니다.', '복구할 수 없습니다.']}).then(function(ok){
+    if(!ok){ return; }
+    postJSON('/api/log/purge', {scope:'one', ip:r.ip, ts:r.ts, path:r.path, status:r.status})
+      .then(function(res){ showUndo((res.ok?'✅ ':'⚠ ')+(res.message||''), null); afterAction(); });
+  });
+}
+function delPurgeAll(){
+  askConfirm({title:'삭제함 비우기', confirmLabel:'영구 삭제', danger:true, twoStep:true,
+    lines:['삭제함의 모든 기록을 완전히 지웁니다.', '복구할 수 없습니다.']}).then(function(ok){
+    if(!ok){ return; }
+    postJSON('/api/log/purge', {scope:'all'}).then(function(res){ showUndo((res.ok?'✅ ':'⚠ ')+(res.message||''), null); afterAction(); });
+  });
+}
 document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closeDetail(); });
 
 function tick(){
@@ -2127,6 +2330,9 @@ def run_dashboard(a):
                 # 조치 기록 화면 — 요청마다 자기 DB 연결을 열고 닫는다(SQLite 스레드 규칙)
                 body = json.dumps(load_history(a.db), ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
+            elif self.path.startswith("/api/deleted"):
+                body = json.dumps(load_deleted(a.db), ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
             elif self.path == "/" or self.path.startswith("/?"):
                 self._send(200, page, "text/html; charset=utf-8")
             else:
@@ -2134,7 +2340,8 @@ def run_dashboard(a):
 
         def do_POST(self):   # noqa: N802 — 조치 버튼(차단/해제/증거/신뢰)이 부르는 창구
             if self.path not in ("/api/block", "/api/unblock", "/api/evidence",
-                                 "/api/trust", "/api/untrust"):
+                                 "/api/trust", "/api/untrust",
+                                 "/api/log/delete", "/api/log/restore", "/api/log/purge"):
                 self._send(404, b"not found", "text/plain; charset=utf-8")
                 return
             allowed, why = _post_allowed(self.headers, token)
@@ -2180,6 +2387,12 @@ def run_dashboard(a):
                 if res.get("ok"):
                     with lock:
                         state["trusted"].discard(ip)
+            elif self.path == "/api/log/delete":
+                res = delete_logs(a.db, data)
+            elif self.path == "/api/log/restore":
+                res = restore_logs(a.db, data)
+            elif self.path == "/api/log/purge":
+                res = purge_logs(a.db, data)
             else:                                   # /api/evidence
                 res = export_evidence(a.db, ip)
             self._send(200, json.dumps(res, ensure_ascii=False).encode("utf-8"),

@@ -17,7 +17,7 @@ from logsentry import (LoginTracker, _block_refusal, _host_ok, _post_allowed, _i
                        _target_rule, _valid_ipv4, alert_key, analyze,
                        analyze_logins, block_ip, build_dashboard_payload,
                        build_timeline, detect_distributed, export_evidence,
-                       load_config, load_history, load_trusted, open_db, parse_line,
+                       delete_logs, load_config, load_deleted, load_history, load_trusted, purge_logs, restore_logs, open_db, parse_line,
                        recent_intrusions, recommend, send_webhook, store_events,
                        trust_ip, unblock_ip, untrust_ip)
 
@@ -807,6 +807,90 @@ class TestBrandLogo(unittest.TestCase):
         """공개 템플릿엔 회사 로고(data URI)가 없다 — 기본 자리표시자만."""
         self.assertIn("__LS_LOGO__", logsentry._DASHBOARD_HTML)
         self.assertNotIn("data:image", logsentry._DASHBOARD_HTML)
+
+
+class TestLogDeleteRestore(unittest.TestCase):
+    """[v3.10] 공격 내역 삭제(소프트)·복구·영구삭제 — 대표님 요청."""
+
+    def _db(self):
+        fd, p = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        lines = [nginx("203.0.113.50", f"09:00:0{i}", "GET", pt, 404, "sqlmap")
+                 for i, pt in enumerate(PROBES[:3])]
+        lines += [nginx("198.51.100.7", f"09:01:0{i}", "GET", f"/x{i}", 404, "curl") for i in range(2)]
+        ev = [e for e in (parse_line(l) for l in lines) if e]
+        conn = open_db(p); store_events(conn, ev); conn.close()
+        return p
+
+    def test_delete_one_hides_from_timeline_and_goes_to_trash(self):
+        p = self._db()
+        try:
+            conn = open_db(p); tl = recent_intrusions(conn); conn.close()
+            self.assertEqual(len(tl), 5)
+            row = tl[0]
+            r = delete_logs(p, {"scope": "one", "ip": row["ip"], "ts": row["ts_iso"],
+                                "path": row["path"], "status": row["status"]})
+            self.assertEqual(r["count"], 1)
+            conn = open_db(p)
+            self.assertEqual(len(recent_intrusions(conn)), 4)   # 타임라인에서 사라짐
+            conn.close()
+            self.assertEqual(len(load_deleted(p)["rows"]), 1)   # 삭제함에 있음
+        finally:
+            os.remove(p)
+
+    def test_delete_by_ip_and_restore(self):
+        p = self._db()
+        try:
+            r = delete_logs(p, {"scope": "ip", "ip": "198.51.100.7"})
+            self.assertEqual(r["count"], 2)
+            conn = open_db(p)
+            ips = {t["ip"] for t in recent_intrusions(conn)}; conn.close()
+            self.assertNotIn("198.51.100.7", ips)
+            restore_logs(p, {"scope": "ip", "ip": "198.51.100.7"})
+            conn = open_db(p)
+            ips = {t["ip"] for t in recent_intrusions(conn)}; conn.close()
+            self.assertIn("198.51.100.7", ips)                  # 복구됨
+            self.assertEqual(len(load_deleted(p)["rows"]), 0)
+        finally:
+            os.remove(p)
+
+    def test_deleted_survives_rescan(self):
+        """삭제한 건은 같은 로그를 다시 저장해도 되살아나지 않는다(소프트 삭제 유지)."""
+        p = self._db()
+        try:
+            delete_logs(p, {"scope": "ip", "ip": "198.51.100.7"})
+            lines = [nginx("198.51.100.7", f"09:01:0{i}", "GET", f"/x{i}", 404, "curl") for i in range(2)]
+            ev = [e for e in (parse_line(l) for l in lines) if e]
+            conn = open_db(p); store_events(conn, ev)           # 재스캔(중복 저장 시도)
+            ips = {t["ip"] for t in recent_intrusions(conn)}; conn.close()
+            self.assertNotIn("198.51.100.7", ips)
+        finally:
+            os.remove(p)
+
+    def test_purge_is_permanent(self):
+        p = self._db()
+        try:
+            delete_logs(p, {"scope": "ip", "ip": "198.51.100.7"})
+            self.assertEqual(len(load_deleted(p)["rows"]), 2)
+            r = purge_logs(p, {"scope": "all"})
+            self.assertEqual(r["count"], 2)
+            self.assertEqual(len(load_deleted(p)["rows"]), 0)   # 삭제함 비워짐
+            conn = open_db(p)
+            total = conn.execute("SELECT COUNT(*) FROM intrusion").fetchone()[0]; conn.close()
+            self.assertEqual(total, 3)                          # 영구 삭제라 행 자체가 사라짐
+        finally:
+            os.remove(p)
+
+    def test_restore_all(self):
+        p = self._db()
+        try:
+            delete_logs(p, {"scope": "ip", "ip": "203.0.113.50"})
+            delete_logs(p, {"scope": "ip", "ip": "198.51.100.7"})
+            self.assertEqual(len(load_deleted(p)["rows"]), 5)
+            restore_logs(p, {"scope": "all"})
+            self.assertEqual(len(load_deleted(p)["rows"]), 0)
+            conn = open_db(p); self.assertEqual(len(recent_intrusions(conn)), 5); conn.close()
+        finally:
+            os.remove(p)
 
 
 if __name__ == "__main__":
