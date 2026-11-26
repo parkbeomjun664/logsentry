@@ -1140,6 +1140,19 @@ def _set_deleted(db_path, data, flag):
 
 
 def delete_logs(db_path, data):
+    if data.get("scope") == "all":            # 타임라인 전체를 삭제함으로
+        if not db_path or not os.path.exists(db_path):
+            return {"ok": False, "count": 0, "message": "DB 없음"}
+        try:
+            conn = open_db(db_path)
+            now = datetime.now().isoformat(timespec="seconds")
+            cur = conn.execute(
+                "UPDATE intrusion SET deleted=1, deleted_at=? WHERE COALESCE(deleted,0)=0", [now])
+            conn.commit(); n = cur.rowcount; conn.close()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "count": 0, "message": f"처리 실패: {e}"}
+        _audit(db_path, "", "log_delete", "ok", f"{n}건 전체 삭제")
+        return {"ok": True, "count": n, "message": f"{n}건을 모두 삭제했습니다(삭제함에서 복구 가능)."}
     return _set_deleted(db_path, data, 1)
 
 
@@ -1559,6 +1572,59 @@ _DASHBOARD_HTML = """<!doctype html>
             padding:9px 12px; margin-bottom:10px; font-size:13px;
             display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
   .tlab { color:var(--green); font-weight:600; }
+
+  /* ── 보안 콘솔 디자인 다듬기 (Wazuh/Grafana/CrowdSec 참고) ── */
+  :root { --radius:10px; }
+  body { font-family:"Pretendard","Segoe UI",system-ui,sans-serif;
+         background:
+           radial-gradient(900px 500px at 88% -8%, rgba(88,166,255,.06), transparent 60%),
+           var(--bg); background-attachment:fixed; }
+  /* 헤더: 아래 얇은 그라데이션 포인트 라인 */
+  header { position:relative; }
+  header::after { content:""; position:absolute; left:0; right:0; bottom:-1px; height:2px;
+                  background:linear-gradient(90deg, var(--accent), transparent 55%); opacity:.5; }
+  header h1 { letter-spacing:-.01em; }
+  /* 숫자 타일 */
+  .tile { position:relative; overflow:hidden; transition:border-color .15s, transform .15s, box-shadow .15s; }
+  .tile .n { font-size:33px; letter-spacing:-.02em; }
+  .tile .l { display:flex; align-items:center; gap:7px; }
+  .tile .l::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--faint); flex:none; }
+  .tile.danger .l::before { background:var(--danger); box-shadow:0 0 7px var(--danger); }
+  .tile.warn .l::before { background:var(--warn); box-shadow:0 0 7px var(--warn); }
+  .tile.clk:hover { box-shadow:0 6px 20px rgba(0,0,0,.28); }
+  /* 테이블 헤더: 소형 대문자 라벨 */
+  th { text-transform:uppercase; letter-spacing:.05em; font-size:10.5px; font-weight:600;
+       border-bottom:1px solid var(--border2); }
+  tbody tr td { transition:background .1s; }
+  tr.alert td:first-child { border-left:3px solid var(--danger); }
+  tr.watch td:first-child { border-left:3px solid var(--warn); }
+  tbody tr.clk:hover td { background:var(--hover); }
+  /* 유형 = 심각도 알약 + 상태 점 */
+  .kpill { display:inline-flex; align-items:center; gap:6px; padding:2px 10px 2px 8px;
+           border-radius:20px; font-size:12px; font-weight:600; white-space:nowrap;
+           border:1px solid transparent; }
+  .kpill .sdot { width:7px; height:7px; border-radius:50%; flex:none; }
+  .kpill.alert { background:var(--bdg-d-bg); color:var(--bdg-d-fg); border-color:rgba(248,81,73,.25); }
+  .kpill.alert .sdot { background:var(--danger); box-shadow:0 0 6px var(--danger); }
+  .kpill.watch { background:var(--bdg-w-bg); color:var(--bdg-w-fg); border-color:rgba(210,153,34,.25); }
+  .kpill.watch .sdot { background:var(--warn); }
+  td.st { font-variant-numeric:tabular-nums; }
+  /* Top 패널: 막대에 은은한 그라데이션 */
+  .panel { box-shadow:0 1px 0 rgba(0,0,0,.15); }
+  .prow .bar { background:linear-gradient(90deg, var(--stripe), transparent); }
+  .prow.alert .bar { background:linear-gradient(90deg, var(--bdg-d-bg), transparent); }
+  .prow:hover { background:var(--hover); }
+  /* 타임라인 '전체 삭제' 작은 버튼 */
+  .tlbtn { float:right; text-transform:none; letter-spacing:0; font-weight:600; font-size:11px;
+           background:var(--btn-bg); color:var(--muted); border:1px solid var(--border2);
+           border-radius:7px; padding:3px 10px; cursor:pointer; }
+  .tlbtn:hover { border-color:var(--danger); color:var(--danger); }
+  /* 모달 */
+  .modal { box-shadow:0 20px 60px rgba(0,0,0,.5); }
+  .kv .k { text-transform:uppercase; letter-spacing:.04em; font-size:11px; }
+  .kv .v.ip, .kv .v.path { font-family:ui-monospace,Consolas,monospace; }
+  /* 상단 버튼(헤더) 간격 */
+  .hr { gap:8px; }
 </style>
 </head>
 <body>
@@ -1596,7 +1662,8 @@ _DASHBOARD_HTML = """<!doctype html>
       <input id="search" class="search" type="search" oninput="onSearch(this.value)"
              placeholder="🔎 IP·경로·도구 검색…">
     </div>
-    <h2>실시간 타임라인 <span class="h2sub">줄 클릭 → 상세·조치</span></h2>
+    <h2>실시간 타임라인 <span class="h2sub">줄 클릭 → 상세·조치</span>
+      <button class="tlbtn" onclick="doDeleteAll()">🗑 전체 삭제</button></h2>
     <table>
       <thead><tr><th>날짜·시각</th><th>IP</th><th>노린 경로</th><th>유형</th><th>상태</th></tr></thead>
       <tbody id="rows"></tbody>
@@ -1776,13 +1843,14 @@ function renderRows(){
     if(!matchSearch(e)){ continue; }
     shown++;
     var cls = e.severity === '위험' ? 'alert' : 'watch';   // 위험=빨강, 경고=주황
+    var kpill = '<span class="kpill ' + cls + '"><span class="sdot"></span>' + esc(e.kind) + '</span>';
     var tool = e.tool ? ' <span class="badge watch">도구</span>' : '';
     var blk = (BLOCKED.indexOf(e.ip) >= 0) ? ' <span class="badge blk">차단됨</span>' : '';
     out.push('<tr class="clk ' + cls + '" onclick="openDetail(' + i + ')">'
       + '<td class="ip when">' + whenHtml(e) + '</td>'
       + '<td class="ip">' + esc(e.ip) + inBadge(e.ip) + blk + '</td>'
       + '<td class="path">' + esc(e.path) + '</td>'
-      + '<td>' + esc(e.kind) + tool + '</td>'
+      + '<td>' + kpill + tool + '</td>'
       + '<td class="st">' + e.status + '</td>'
       + '</tr>');
   }
@@ -2145,6 +2213,20 @@ function doDeleteLog(){
         .then(function(res){ showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''),
           res.ok ? function(){ postJSON('/api/log/restore', {scope:'one', ip:e.ip, ts:e.ts_iso || '', path:e.path, status:e.status}).then(function(){ tick(); }); } : null);
           afterAction(); });
+    });
+}
+// 타임라인 전체 삭제(소프트) — 전부 삭제함으로. 되돌리기(전체 복구) 제공.
+function doDeleteAll(){
+  askConfirm({title:'전체 삭제', confirmLabel:'전체 삭제', danger:true, twoStep:true,
+    lines:['지금 타임라인의 모든 공격 기록을 목록에서 지웁니다.',
+           '삭제함으로 옮겨져 전체 복구할 수 있어요(영구 삭제 아님).']})
+    .then(function(ok){
+      if(!ok){ return; }
+      postJSON('/api/log/delete', {scope:'all'}).then(function(res){
+        showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''),
+          res.ok ? function(){ postJSON('/api/log/restore', {scope:'all'}).then(function(){ tick(); }); } : null);
+        afterAction();
+      });
     });
 }
 function doDeleteLogIp(){

@@ -880,6 +880,18 @@ class TestLogDeleteRestore(unittest.TestCase):
         finally:
             os.remove(p)
 
+    def test_delete_all(self):
+        p = self._db()
+        try:
+            r = delete_logs(p, {"scope": "all"})
+            self.assertEqual(r["count"], 5)
+            conn = open_db(p); self.assertEqual(len(recent_intrusions(conn)), 0); conn.close()
+            self.assertEqual(len(load_deleted(p)["rows"]), 5)
+            restore_logs(p, {"scope": "all"})
+            conn = open_db(p); self.assertEqual(len(recent_intrusions(conn)), 5); conn.close()
+        finally:
+            os.remove(p)
+
     def test_restore_all(self):
         p = self._db()
         try:
