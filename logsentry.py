@@ -693,6 +693,12 @@ def recommend(ip, path, status, ua, kind):
         actions.append("같은 IP의 반복 실패면 IP 차단, 한 계정에 여러 IP면 그 계정 비밀번호 강제 변경.")
         if status == 423:
             actions.append("상태 423=이미 계정 잠금 발동 → 무차별 대입의 결정적 증거. 우선 대응.")
+    elif kind == "의심 헤더" and status == 403:
+        # 앞단(Caddy 등)이 이미 거절한 경우 — 공격 의도는 그대로지만 앱까지 가지 않았다
+        headline = ("프레임워크 취약점 공격 시도(React2Shell 류) — 앞단에서 이미 거절됨(403). "
+                    "요청이 앱까지 가지 않았습니다.")
+        actions.append("추가 조치는 필요 없습니다. 앞단 거절 규칙이 제대로 작동하고 있다는 뜻입니다.")
+        actions.append("같은 IP가 계속 반복하면 IP 차단을 고려하세요(반복 공격자).")
     elif kind == "의심 헤더":
         headline = ("프레임워크 취약점 공격 시도(예: Next.js 'Next-Action' 헤더를 쓰는 React2Shell 류). "
                     "원격 코드 실행을 노리는 위험한 요청.")
@@ -738,8 +744,14 @@ def _timeline_entry(time_disp, ts_iso, ip, path, method, status, ua, kind):
         "time": time_disp, "ts_iso": ts_iso or "", "ip": ip, "path": path,
         "method": method or "GET", "status": status, "ua": ua or "",
         "kind": kind, "severity": _severity(kind), "tool": is_tool(ua),
+        "edge_blocked": edge_blocked(kind, status),
         "rec": recommend(ip, path, status, ua, kind),
     }
+
+
+def edge_blocked(kind, status):
+    """앞단(Caddy)이 문 앞에서 거절한 공격인지 — 의심 헤더 요청이 403 이면 앱까지 안 간 것."""
+    return kind == "의심 헤더" and status == 403
 
 
 def build_timeline(events, limit=60):
@@ -1654,6 +1666,9 @@ _DASHBOARD_HTML = """<!doctype html>
   .kv .v.ip, .kv .v.path { font-family:ui-monospace,Consolas,monospace; }
   /* 상단 버튼(헤더) 간격 */
   .hr { gap:8px; }
+  /* 앞단(Caddy)에서 거절된 공격 표시 */
+  .badge.edge { background:rgba(46,160,67,.15); color:var(--green); border:1px solid rgba(46,160,67,.4);
+                font-weight:700; white-space:nowrap; }
   /* 여러 건 선택 삭제 */
   .chkcol { width:34px; text-align:center; padding-left:12px; }
   .rchk, #selall { width:15px; height:15px; cursor:pointer; accent-color:var(--accent); vertical-align:middle; }
@@ -1891,6 +1906,7 @@ function renderRows(){
     shown++;
     var cls = e.severity === '위험' ? 'alert' : 'watch';   // 위험=빨강, 경고=주황
     var kpill = '<span class="kpill ' + cls + '"><span class="sdot"></span>' + esc(e.kind) + '</span>';
+    if(e.edge_blocked){ kpill += ' <span class="badge edge" title="앞단(Caddy)에서 거절 — 앱까지 안 감">🛡 앞단 차단</span>'; }
     var tool = e.tool ? ' <span class="badge watch">도구</span>' : '';
     var blk = (BLOCKED.indexOf(e.ip) >= 0) ? ' <span class="badge blk">차단됨</span>' : '';
     var chk = SEL[rowKey(e)] ? ' checked' : '';
@@ -2288,7 +2304,8 @@ function openDetail(i){
   var isblk = BLOCKED.indexOf(e.ip) >= 0;            // 이미 차단된 IP 인가
   var acts = (rec.actions || []).map(function(a){ return '<li>' + esc(a) + '</li>'; }).join('');
   document.getElementById('m-title').innerHTML =
-    '침투 상세 <span class="sev ' + sc + '">' + esc(e.severity) + '</span>';
+    '침투 상세 <span class="sev ' + sc + '">' + esc(e.severity) + '</span>'
+    + (e.edge_blocked ? ' <span class="badge edge">🛡 앞단에서 차단됨(403)</span>' : '');
   document.getElementById('m-body').innerHTML =
       '<div class="kv">'
     +   '<div class="k">시각</div><div class="v ip">' + esc(e.ts_iso || e.time) + '</div>'

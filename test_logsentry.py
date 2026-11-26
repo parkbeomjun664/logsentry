@@ -17,7 +17,7 @@ from logsentry import (LoginTracker, _block_refusal, _host_ok, _post_allowed, _i
                        _target_rule, _valid_ipv4, alert_key, analyze,
                        analyze_logins, block_ip, build_dashboard_payload,
                        build_timeline, detect_distributed, export_evidence,
-                       delete_logs, delete_many, load_config, load_deleted, load_history, load_trusted, purge_logs, restore_logs, open_db, parse_line,
+                       delete_logs, delete_many, edge_blocked, load_config, load_deleted, load_history, load_trusted, purge_logs, restore_logs, open_db, parse_line,
                        recent_intrusions, recommend, send_webhook, store_events,
                        trust_ip, unblock_ip, untrust_ip)
 
@@ -917,6 +917,27 @@ class TestLogDeleteRestore(unittest.TestCase):
             conn = open_db(p); self.assertEqual(len(recent_intrusions(conn)), 5); conn.close()
         finally:
             os.remove(p)
+
+
+class TestEdgeBlocked(unittest.TestCase):
+    """[v3.11] 앞단(Caddy)이 403 으로 거절한 의심 헤더 공격은 '앞단 차단'으로 구분."""
+
+    def test_flag(self):
+        self.assertTrue(edge_blocked("의심 헤더", 403))
+        self.assertFalse(edge_blocked("의심 헤더", 499))      # 앱까지 간 것(이전 상태)
+        self.assertFalse(edge_blocked("권한 밖 경로", 403))    # 앱의 403 은 앞단 차단 아님
+
+    def test_recommend_says_already_blocked(self):
+        r = recommend("203.0.113.10", "/", 403, "Mozilla/5.0", "의심 헤더")
+        self.assertIn("이미 거절", r["headline"])
+        self.assertEqual(r["severity"], "위험")              # 공격 의도는 그대로 위험으로 표시
+        r2 = recommend("203.0.113.10", "/", 499, "Mozilla/5.0", "의심 헤더")
+        self.assertNotIn("이미 거절", r2["headline"])
+
+    def test_timeline_entry_carries_flag(self):
+        from logsentry import _timeline_entry
+        self.assertTrue(_timeline_entry("t", "", "1.2.3.4", "/", "POST", 403, "x", "의심 헤더")["edge_blocked"])
+        self.assertFalse(_timeline_entry("t", "", "1.2.3.4", "/", "POST", 499, "x", "의심 헤더")["edge_blocked"])
 
 
 if __name__ == "__main__":
