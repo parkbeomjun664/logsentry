@@ -1119,5 +1119,146 @@ class TestIpIntel(unittest.TestCase):
             os.remove(p)
 
 
+class TestIncidents(unittest.TestCase):
+    """[v3.13] '뚫렸나?' — 막힌 시도가 아니라 실제 사고일 수 있는 것만 골라낸다."""
+
+    PUB = "27.100.38.10"      # 공인 IP(조회·판정 대상). 문서용 예약 대역은 공인이 아니라서 쓰지 않음
+
+    def setUp(self):
+        import logsentry
+        self.ls = logsentry
+        self._auth, self._secret = logsentry._AUTH_PATHS, logsentry._SECRET_PATHS
+        logsentry._AUTH_PATHS = ("/api/auth/login",)
+
+    def tearDown(self):
+        self.ls._AUTH_PATHS, self.ls._SECRET_PATHS = self._auth, self._secret
+
+    def ev(self, lines):
+        return [e for e in (parse_line(l) for l in lines) if e]
+
+    def test_secret_path_list(self):
+        f = self.ls.is_secret_path
+        for p in ("/.env", "/admin/.env", "/.env.bak", "/.git/config", "/app/.git", "/actuator/heapdump",
+                  "/phpinfo.php?x=1", "/backup.sql"):
+            self.assertTrue(f(p), p)
+        for p in ("/actuator/health", "/admin", "/api/config", "/.github/x", "/ko/login", "/"):
+            self.assertFalse(f(p), p)          # 정상 200 이 나올 수 있는 주소는 사고로 안 봄
+
+    def test_exposure_only_when_success(self):
+        ev = self.ev([nginx(self.PUB, "10:00:00", "GET", "/.env", 404, "curl/8"),
+                      nginx(self.PUB, "10:00:01", "GET", "/.git/config", 200, "curl/8"),
+                      nginx(self.PUB, "10:00:02", "GET", "/actuator/health", 200, "curl/8"),
+                      nginx("192.168.10.5", "10:00:03", "GET", "/.env", 200, "Mozilla/5.0")])
+        incs = self.ls.detect_incidents(ev)
+        self.assertEqual([(i["type"], i["path"]) for i in incs],
+                         [("exposure", "/.git/config"), ("exposure", "/.env")])   # 사내에서 열려도 노출은 노출
+
+    def test_attack_header_success_vs_blocked(self):
+        def line(st):
+            o = json.loads(caddy(self.PUB, 1764000000.0, "POST", "/", st, "Mozilla/5.0"))
+            o["request"]["headers"]["Next-Action"] = ["x"]
+            return json.dumps(o)
+        self.assertEqual(self.ls.detect_incidents(self.ev([line(403)])), [])      # 앞단에서 막힘 = 사고 아님
+        incs = self.ls.detect_incidents(self.ev([line(200)]))
+        self.assertEqual(incs[0]["type"], "attack_ok")
+
+    def test_login_success_plain_is_quiet(self):
+        ev = self.ev([nginx("211.36.1.2", "09:00:00", "POST", "/api/auth/login", 200, "Mozilla/5.0")])
+        self.assertEqual(self.ls.detect_incidents(ev), [])                         # 평범한 국내 로그인
+
+    def test_login_after_many_failures(self):
+        lines = [nginx(self.PUB, f"09:00:0{k}", "POST", "/api/auth/login", 401, "Mozilla/5.0") for k in range(6)]
+        lines.append(nginx(self.PUB, "09:00:09", "POST", "/api/auth/login", 200, "Mozilla/5.0"))
+        incs = self.ls.detect_incidents(self.ev(lines), fail_threshold=5)
+        self.assertEqual(incs[0]["type"], "login")
+        self.assertIn("실패 6회", incs[0]["reasons"][0])
+
+    def test_session_expiry_401s_are_not_attack_signal(self):
+        # 세션 만료된 직원: API 401 을 여러 번 받은 뒤 다시 로그인 → 사고 아님
+        lines = [nginx("211.36.1.2", f"09:00:0{k}", "GET", "/api/orders", 401, "Mozilla/5.0") for k in range(8)]
+        lines.append(nginx("211.36.1.2", "09:00:09", "POST", "/api/auth/login", 200, "Mozilla/5.0"))
+        self.assertEqual(self.ls.detect_incidents(self.ev(lines)), [])
+
+    def test_login_from_ip_that_probed(self):
+        lines = [nginx(self.PUB, "09:00:00", "GET", "/.env", 404, "Mozilla/5.0"),
+                 nginx(self.PUB, "09:00:05", "POST", "/api/auth/login", 200, "Mozilla/5.0")]
+        incs = self.ls.detect_incidents(self.ev(lines))
+        self.assertTrue(any("탐침" in r for r in incs[0]["reasons"]))
+
+    def test_login_hosting_or_foreign_needs_ipinfo(self):
+        ev = self.ev([nginx(self.PUB, "09:00:00", "POST", "/api/auth/login", 200, "Mozilla/5.0")])
+        self.assertEqual(self.ls.detect_incidents(ev, {}), [])                     # 출처 모르면 아직 판단 안 함
+        incs = self.ls.detect_incidents(ev, {self.PUB: {"kind": "cloud", "country": "IN"}})
+        rs = " ".join(incs[0]["reasons"])
+        self.assertIn("호스팅", rs)
+        self.assertIn("해외(인도)", rs)
+        self.assertEqual(self.ls.detect_incidents(ev, {self.PUB: {"kind": "isp", "country": "KR"}}), [])
+
+    def test_internal_login_never_flagged(self):
+        lines = [nginx("192.168.10.1", f"09:00:0{k}", "POST", "/api/auth/login", 401, "Mozilla/5.0") for k in range(7)]
+        lines.append(nginx("192.168.10.1", "09:00:09", "POST", "/api/auth/login", 200, "Mozilla/5.0"))
+        self.assertEqual(self.ls.detect_incidents(self.ev(lines)), [])
+
+    def test_get_on_login_path_is_not_login(self):
+        ev = self.ev([nginx(self.PUB, "09:00:00", "GET", "/api/auth/login", 200, "Mozilla/5.0")])
+        self.assertEqual(self.ls.detect_incidents(ev, {self.PUB: {"kind": "cloud"}}), [])
+
+    def test_store_ack_reopen(self):
+        fd, p = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            ev = self.ev([nginx(self.PUB, "10:00:01", "GET", "/.git/config", 200, "curl/8")])
+            incs = self.ls.detect_incidents(ev)
+            conn = open_db(p)
+            self.assertEqual(len(self.ls.store_incidents(conn, incs)), 1)
+            self.assertEqual(self.ls.store_incidents(conn, incs), [])               # 같은 사고는 다시 '새것' 아님
+            self.assertEqual(len(self.ls.load_incidents(conn)), 1)
+            conn.close()
+            self.assertTrue(self.ls.ack_incident(p, incs[0]["key"], True)["ok"])
+            conn = open_db(p)
+            self.assertEqual(self.ls.load_incidents(conn), [])                       # 확인함 → 열린 목록에서 빠짐
+            self.assertEqual(len(self.ls.load_incidents(conn, open_only=False)), 1)  # 지우진 않음
+            conn.close()
+            self.ls.ack_incident(p, incs[0]["key"], False)
+            conn = open_db(p)
+            self.assertEqual(len(self.ls.load_incidents(conn)), 1)                  # 다시 열기
+            conn.close()
+            self.assertFalse(self.ls.ack_incident(p, "없는키", True)["ok"])
+        finally:
+            os.remove(p)
+
+    def test_today_summary(self):
+        fd, p = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            conn = open_db(p)
+            day = "2026-11-10"
+            for k, st in enumerate((404, 401, 403, 307, 499)):
+                conn.execute("INSERT INTO intrusion(ts, ip, path, status, kind) VALUES(?,?,?,?,?)",
+                             (f"{day}T09:00:0{k}+09:00", self.PUB, f"/x{k}", st, "없는 주소"))
+            conn.execute("INSERT INTO intrusion(ts, ip, path, status, kind) VALUES(?,?,?,?,?)",
+                         ("2026-11-09T23:59:59+09:00", self.PUB, "/y", 404, "없는 주소"))   # 어제
+            conn.commit()
+            self.assertEqual(self.ls.today_summary(conn=conn, today=day),
+                             {"date": day, "attempts": 5, "blocked": 3})   # 307·499 는 '막힘' 아님
+            conn.close()
+        finally:
+            os.remove(p)
+
+    def test_login_ips_get_lookup_priority(self):
+        ev = self.ev([nginx(self.PUB, "09:00:00", "POST", "/api/auth/login", 200, "Mozilla/5.0")])
+        payload = {"logins": self.ls.recent_logins(ev), "timeline": [{"ip": "8.8.8.8"}]}
+        self.assertEqual(self.ls.payload_ips(payload)[0], self.PUB)
+
+    def test_secret_paths_config(self):
+        fd, p = tempfile.mkstemp(suffix=".json"); os.close(fd)
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"secret_paths_extra": ["/internal-dump"]}, f)
+            load_config(p)
+            self.assertTrue(self.ls.is_secret_path("/internal-dump/a"))
+            self.assertTrue(self.ls.is_secret_path("/.env"))                         # 기본 목록은 유지
+        finally:
+            os.remove(p)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

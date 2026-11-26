@@ -97,7 +97,7 @@ def load_config(path):
     코드를 고치지 않고 회사마다 탐침 경로·도구 지문·신뢰 IP·문턱을 바꾸게 한다.
     파일이 없거나 읽기 실패하면 조용히 기본값을 쓴다(도구가 멈추지 않게).
     """
-    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS, _BRAND, _BRAND_LOGO, _IP_LOOKUP
+    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS, _BRAND, _BRAND_LOGO, _IP_LOOKUP, _SECRET_PATHS
     thresholds = dict(DEFAULT_THRESHOLDS)
     thresholds["webhook"] = ""   # 알림 웹훅 주소(선택) — 설정 파일로 덮어씀
     if not path or not os.path.exists(path):
@@ -120,10 +120,13 @@ def load_config(path):
         _AUTH_STATUSES = tuple(cfg["auth_statuses"])
     if "auth_paths" in cfg:
         _AUTH_PATHS = tuple(cfg["auth_paths"])
+    if "secret_paths" in cfg:
+        _SECRET_PATHS = tuple(str(x) for x in cfg["secret_paths"])
     if "suspicious_headers" in cfg:
         _SUSPICIOUS_HEADERS = tuple(str(h).lower() for h in cfg["suspicious_headers"])
     # *_extra 키는 기본 목록을 덮지 않고 '덧붙인다' — 덮어쓰기 키 다음에 처리(기본 탐침·소음·도구 목록을 그대로 두고 한두 개만 추가할 때)
-    for key, name in (("tool_ua_extra", "_TOOL_UA"), ("probe_paths_extra", "_PROBE_PATHS"), ("skip_extra", "_SKIP")):
+    for key, name in (("tool_ua_extra", "_TOOL_UA"), ("probe_paths_extra", "_PROBE_PATHS"), ("skip_extra", "_SKIP"),
+                      ("secret_paths_extra", "_SECRET_PATHS")):
         if key in cfg:
             globals()[name] = tuple(globals()[name]) + tuple(x for x in cfg[key] if x not in globals()[name])
     if "brand" in cfg and str(cfg["brand"]).strip():
@@ -573,11 +576,11 @@ def send_webhook(url, results):
     if not url or not alerts:
         return
     lines = [f"🔴 {r['ip']} 점수 {r['score']} — {' · '.join(r['reasons'])}" for r in alerts]
-    text = f"[LogSentry] 경보 {len(alerts)}건\n" + "\n".join(lines)
+    text = f"[{_BRAND}] 경보 {len(alerts)}건\n" + "\n".join(lines)
     payload = json.dumps({"text": text}).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload, method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": "LogSentry"})
+        headers={"Content-Type": "application/json", "User-Agent": _BRAND})
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             resp.read()
@@ -805,6 +808,11 @@ def open_db(path):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS ip_info("
         "ip TEXT PRIMARY KEY, data TEXT, looked_at TEXT)")
+    # 사고 의심('뚫렸나?') — 확인함(ack) 표시로 처리, 지우지 않음
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS incident("
+        "key TEXT PRIMARY KEY, ts TEXT, ip TEXT, type TEXT, data TEXT,"
+        "ack INTEGER DEFAULT 0, ack_at TEXT, found_at TEXT)")
     # 소프트 삭제 — 화면에서 지워도 바로 안 없애고 '삭제함'으로 옮겨 복구할 수 있게.
     # 이미 쓰던 DB 에도 칸을 더한다(없을 때만). 기존 행은 deleted=0(안 지움).
     cols = {r[1] for r in conn.execute("PRAGMA table_info(intrusion)")}
@@ -1605,7 +1613,8 @@ def _ipinfo_fresh(info, now_ts):
 def payload_ips(payload):
     """화면에 보이는 IP 들(타임라인 최근 순 → 경보 → Top). 조회 우선순위 그대로."""
     seen, out = set(), []
-    for src in (payload.get("timeline") or [], payload.get("alerts") or [], payload.get("top_ips") or []):
+    for src in (payload.get("logins") or [], payload.get("incidents") or [],
+                payload.get("timeline") or [], payload.get("alerts") or [], payload.get("top_ips") or []):
         for row in src:
             ip = row.get("ip")
             if ip and ip not in seen:
@@ -1642,6 +1651,179 @@ def load_ipinfo(conn):
         except (ValueError, TypeError):
             continue
     return out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# '뚫렸나?' — 막힌 시도 수천 건이 아니라, 실제 사고일 수 있는 것만 골라낸다.
+#   ① 노출: 절대 200 이 나오면 안 되는 비밀 파일·관리 주소가 성공 응답을 받음
+#           (탐침 경로 목록과 따로 둔다 — /actuator/health·/admin 처럼 정상 200 인 주소가 섞여 있어서)
+#   ② 공격 성공: 취약점 공격 요청(의심 헤더)이 앱에서 성공 응답을 받음
+#   ③ 수상한 로그인 성공: 공인 IP 에서 로그인 성공인데 — 실패 여러 번 뒤 / 공격 신호를 보낸 IP /
+#      호스팅·검색엔진 IP / 해외 IP. (401·404 는 공격 근거로 안 친다: 세션 만료된 직원도 401 을 받음)
+# ──────────────────────────────────────────────────────────────────────────
+_SECRET_PATHS = ("/.env", "/.git/", "/.aws/", "/.ssh/", "/.svn/", "/.htpasswd", "/wp-config.php",
+                 "/phpinfo.php", "/server-status", "/actuator/env", "/actuator/heapdump",
+                 "/actuator/configprops", "/actuator/mappings", "/actuator/prometheus",
+                 "/actuator/threaddump", "/actuator/loggers", "/backup.", "/dump.sql", "/db.sql",
+                 "/.vscode/sftp.json", "/.ds_store")
+
+_INCIDENT_ADVICE = {
+    "exposure": ("브라우저로 그 주소를 직접 열어 실제 내용(비밀번호·설정·소스)이 보이는지 확인하세요. "
+                 "보이면 즉시 웹서버(Caddy)에서 그 주소를 막고, 그 안에 있던 비밀번호·키를 전부 바꾸세요. "
+                 "내용 없이 일반 화면만 나오면(앱이 모든 주소에 200 화면을 주는 구조) 오탐입니다."),
+    "attack_ok": ("취약점 공격이 앱까지 들어가 성공 응답을 받았습니다. 앱 버전이 패치됐는지, 서버에 새 파일·"
+                  "프로세스가 생겼는지 즉시 점검하고, 이 IP 를 차단하세요."),
+    "login": ("그 시각에 로그인한 직원이 있는지 먼저 확인하세요(해외 출장·VPN 일 수 있음). 아니라면 해당 계정 "
+              "비밀번호를 바로 바꾸고, 로그인 상태를 강제로 끊고, 이 IP 를 차단한 뒤 그 계정으로 한 작업 기록을 보세요."),
+}
+_INCIDENT_TITLE = {
+    "exposure": "숨겨야 할 파일·관리 주소가 성공 응답(2xx)을 받음",
+    "attack_ok": "취약점 공격 요청이 앱에서 성공 응답(2xx)을 받음",
+    "login": "의심스러운 곳에서 로그인 성공",
+}
+
+
+def is_secret_path(path):
+    """절대 밖으로 열리면 안 되는 파일·관리 주소인가(경로 중간에 있어도: /admin/.env 등)."""
+    p = str(path or "").split("?")[0].lower()
+    return any(s.lower() in p for s in _SECRET_PATHS) or p.endswith("/.git")
+
+
+def _is_internal(ip):
+    """사내·사설·루프백 등 인터넷 공인 주소가 아닌가(IPv6 포함). 이상한 값은 안전하게 '내부'로."""
+    try:
+        return not ipaddress.ip_address(str(ip).strip()).is_global
+    except ValueError:
+        return True
+
+
+def _login_success(e):
+    """로그인 성공인가 — 로그인 경로를 지정했고, 그 경로에 POST 해서 2xx."""
+    return (bool(_AUTH_PATHS) and _on_auth_path(e["path"]) and 200 <= e["status"] < 300
+            and (e.get("method") or "GET").upper() == "POST")
+
+
+def detect_incidents(events, ipinfo=None, fail_threshold=5):
+    """요청 목록 → 사고 의심 목록. 같은 요청은 늘 같은 key 라서 DB 에 한 번만 쌓인다."""
+    ipinfo = ipinfo or {}
+    fails, bad = defaultdict(int), set()
+    out = []
+    evs = sorted((e for e in events if e.get("ts")), key=lambda e: e["ts"].timestamp())
+    for e in evs:
+        ip, path, st = e["ip"], e["path"], e["status"]
+        if any(path.startswith(s) for s in _SKIP):
+            continue
+        odd = _odd_flags(e)
+        if _is_auth_fail(e):
+            fails[ip] += 1
+        if is_probe_path(path) or odd or is_tool(e.get("ua")):
+            bad.add(ip)                       # 명백한 공격 신호를 보낸 IP(401·404 만으로는 안 넣음)
+        typ, reasons = None, []
+        ok = 200 <= st < 300
+        if ok and is_secret_path(path):
+            typ, reasons = "exposure", [f"{e.get('method') or 'GET'} {path} → {st}"]
+        elif ok and any(f.startswith("의심 헤더") for f in odd):
+            typ, reasons = "attack_ok", [f"{', '.join(odd)} → {st}"]
+        elif _login_success(e) and not _is_internal(ip):
+            info = ipinfo.get(ip) or {}
+            if fails[ip] >= fail_threshold:
+                reasons.append(f"같은 IP 의 로그인 실패 {fails[ip]}회 뒤 성공(무차별 대입 성공 의심 — 직원이 여러 번 틀렸을 수도)")
+            if ip in bad:
+                reasons.append("탐침·취약점 공격·도구 접근을 보낸 IP 에서 로그인 성공")
+            if info.get("kind") in ("cloud", "scanner"):
+                reasons.append(("호스팅(빌린 서버)" if info["kind"] == "cloud" else "검색엔진")
+                               + " IP 에서 로그인 성공 — 일반 직원 회선이 아님(VPN 일 수 있음)")
+            c = str(info.get("country") or "")
+            if c and c != "KR":
+                reasons.append(f"해외({_COUNTRY_KO.get(c, c)}) IP 에서 로그인 성공")
+            if reasons:
+                typ = "login"
+        if typ:
+            ts_iso = e["ts"].isoformat()
+            out.append({"key": f"{typ}|{ts_iso}|{ip}|{path}|{st}", "type": typ, "ts": ts_iso, "ip": ip,
+                        "path": _clip(path, 200), "method": e.get("method") or "GET", "status": st,
+                        "title": _INCIDENT_TITLE[typ], "reasons": reasons, "advice": _INCIDENT_ADVICE[typ]})
+    return out
+
+
+def recent_logins(events, limit=20):
+    """최근 로그인 성공(공인 IP) — 출처 조회를 먼저 하도록 우선순위에 쓴다."""
+    seen, out = set(), []
+    for e in sorted((x for x in events if x.get("ts")), key=lambda x: x["ts"].timestamp(), reverse=True):
+        if _login_success(e) and not _is_internal(e["ip"]) and e["ip"] not in seen:
+            seen.add(e["ip"])
+            out.append({"ip": e["ip"], "ts_iso": e["ts"].isoformat()})
+            if len(out) >= limit:
+                break
+    return out
+
+
+def store_incidents(conn, incidents):
+    """새 사고만 저장하고, 새로 들어간 것만 돌려준다(알림은 새것만 보내야 하니까)."""
+    now = datetime.now().isoformat(timespec="seconds")
+    fresh = []
+    for inc in incidents:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO incident(key, ts, ip, type, data, ack, found_at) VALUES(?,?,?,?,?,0,?)",
+            (inc["key"], inc["ts"], inc["ip"], inc["type"], json.dumps(inc, ensure_ascii=False), now))
+        if cur.rowcount:
+            fresh.append(inc)
+    conn.commit()
+    return fresh
+
+
+def load_incidents(conn, open_only=True, limit=100):
+    q = "SELECT data, ack, ack_at, found_at FROM incident"
+    if open_only:
+        q += " WHERE ack=0"
+    q += " ORDER BY ts DESC LIMIT ?"
+    out = []
+    for data, ack, ack_at, found_at in conn.execute(q, (limit,)).fetchall():
+        try:
+            d = json.loads(data)
+        except (ValueError, TypeError):
+            continue
+        d.update({"ack": bool(ack), "ack_at": ack_at or "", "found_at": found_at or ""})
+        out.append(d)
+    return out
+
+
+def ack_incident(db_path, key, ack=True):
+    """사고를 '확인함'(처리 완료)으로 — 지우지 않고 표시만(되돌릴 수 있게, 감사기록 남김)."""
+    if not db_path or not key:
+        return {"ok": False, "message": "대상이 없습니다."}
+    try:
+        conn = open_db(db_path)
+        cur = conn.execute("UPDATE incident SET ack=?, ack_at=? WHERE key=?",
+                           (1 if ack else 0, datetime.now().isoformat(timespec="seconds") if ack else None, key))
+        conn.commit()
+        n = cur.rowcount
+        ip = (conn.execute("SELECT ip FROM incident WHERE key=?", (key,)).fetchone() or [""])[0]
+        conn.close()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "message": f"처리 실패: {e}"}
+    if not n:
+        return {"ok": False, "message": "해당 사고 기록이 없습니다."}
+    _audit(db_path, ip, "incident_ack" if ack else "incident_reopen", "ok", key[:120])
+    return {"ok": True, "message": "확인함으로 표시했습니다(사고 기록에서 다시 열 수 있음)." if ack
+            else "다시 '확인 필요'로 돌렸습니다."}
+
+
+def today_summary(conn=None, events=None, today=None):
+    """오늘(서버 시각) 공격 시도 수와 그중 차단·거절(4xx, 499 제외) 수 — 신호등 한 줄용."""
+    day = today or datetime.now().strftime("%Y-%m-%d")
+    if conn is not None:
+        row = conn.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN status BETWEEN 400 AND 498 THEN 1 ELSE 0 END) FROM intrusion"
+            " WHERE COALESCE(deleted,0)=0 AND ts LIKE ?", (day + "%",)).fetchone()
+        return {"date": day, "attempts": row[0] or 0, "blocked": row[1] or 0}
+    n = b = 0
+    for e in events or []:
+        if e.get("ts") and e["ts"].strftime("%Y-%m-%d") == day and _is_suspicious(e) \
+                and not any(e["path"].startswith(s) for s in _SKIP):
+            n += 1
+            b += 1 if 400 <= e["status"] <= 498 else 0
+    return {"date": day, "attempts": n, "blocked": b}
 
 
 def build_dashboard_payload(results, dist, timeline=None):
@@ -1979,6 +2161,30 @@ _DASHBOARD_HTML = """<!doctype html>
   :root[data-theme="light"] .where.k-scanner { color:#0969da; }
   :root[data-theme="light"] .where.k-isp     { color:#1b7c83; }
   .knote { color:var(--muted); font-size:12px; }
+  /* 맨 위 신호등 — 초록=조치 필요 없음 / 빨강=확인 필요(사고 의심) / 주황=감시 이상 */
+  .lamp { margin:16px 20px 0; border-radius:12px; padding:12px 16px; border:1px solid var(--border2); background:var(--panel); }
+  .lamp:empty { display:none; }
+  .lamp .lhead { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:14px; }
+  .lamp .ldot { width:11px; height:11px; border-radius:50%; flex:none; }
+  .lamp .lsub { color:var(--muted); font-size:13px; }
+  .lamp .lhead .lbtn { margin-left:auto; }
+  .lamp.green { border-color:rgba(46,160,67,.45); background:rgba(46,160,67,.08); }
+  .lamp.green .ldot { background:var(--green); box-shadow:0 0 8px var(--green); }
+  .lamp.green b { color:var(--green); }
+  .lamp.red { border-color:var(--danger); background:rgba(248,81,73,.08); }
+  .lamp.red .ldot { background:var(--danger); box-shadow:0 0 10px var(--danger); animation:lpulse 1.4s infinite; }
+  .lamp.red b { color:var(--danger); }
+  .lamp.orange { border-color:var(--warn); background:rgba(210,153,34,.08); }
+  .lamp.orange .ldot { background:var(--warn); box-shadow:0 0 8px var(--warn); }
+  .lamp.orange b { color:var(--warn); }
+  @keyframes lpulse { 50% { opacity:.35; } }
+  @media (prefers-reduced-motion: reduce) { .lamp.red .ldot { animation:none; } }
+  .lamp .lrow { display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:8px 0 2px; margin-top:8px;
+                border-top:1px solid var(--rowline); font-size:13px; }
+  .lamp .ltag { background:var(--bdg-d-bg); color:var(--bdg-d-fg); border-radius:10px; padding:1px 9px; font-weight:700; font-size:12px; }
+  .lamp .ltitle { flex:1; min-width:200px; }
+  .lamp .lbtns { display:flex; gap:6px; }
+  .lbtn.ok { border-color:var(--green); color:var(--green); }
   /* 여러 건 선택 삭제 */
   .chkcol { width:34px; text-align:center; padding-left:12px; }
   .rchk, #selall { width:15px; height:15px; cursor:pointer; accent-color:var(--accent); vertical-align:middle; }
@@ -2007,6 +2213,8 @@ _DASHBOARD_HTML = """<!doctype html>
       <span id="status"><span class="dot"></span>연결 중…</span>
     </div>
   </header>
+
+  <div id="lamp" class="lamp"></div>
 
   <div class="tiles">
     <div class="tile clk" onclick="tileClick('attempt')" title="클릭: 공격 요청 전체를 타임라인에서 보기">
@@ -2122,6 +2330,7 @@ function render(d){
   TRUSTED = d.trusted || [];
   IPINFO = d.ipinfo || {}; IP_LOOKUP = !!d.ip_lookup;
   renderTop(d);
+  renderLamp(d);
   renderBlocked();
   renderTrusted();
   renderFilters();
@@ -2388,6 +2597,101 @@ function askConfirm(opts){
 
 // 조치 후 8초간 '실행 취소' 버튼을 띄운다(실수로 눌러도 되돌릴 수 있게).
 var __toastTimer = null;
+// ── 맨 위 신호등 + '뚫렸나?' 사고 목록 — 비전문가가 10초 안에 '괜찮은지' 알게 ──
+var INCIDENTS = [], INCHIST = [], TODAY = null;
+var INC_TYPE_KO = {exposure:'노출 의심', attack_ok:'공격 성공 의심', login:'수상한 로그인'};
+function renderLamp(d){
+  INCIDENTS = d.incidents || [];
+  TODAY = d.today || null;
+  var el = document.getElementById('lamp');
+  if(!el){ return; }
+  var hist = '<button class="lbtn" onclick="openIncidentHistory()">사고 기록</button>';
+  if(INCIDENTS.length){
+    el.className = 'lamp red';
+    el.innerHTML = '<div class="lhead"><span class="ldot"></span><b>확인 필요 ' + INCIDENTS.length + '건</b>'
+      + '<span class="lsub">막힌 시도가 아니라 실제 사고일 수 있는 기록이에요. 하나씩 보고 [확인함]을 눌러 주세요.</span>' + hist + '</div>'
+      + INCIDENTS.map(function(x, i){
+          return '<div class="lrow"><span class="ltag">' + esc(INC_TYPE_KO[x.type] || x.type) + '</span>'
+            + '<span class="mono">' + esc(fmtTs(x.ts)) + '</span>'
+            + '<span class="mono">' + esc(x.ip) + inBadge(x.ip) + whereHtml(x.ip) + '</span>'
+            + '<span class="ltitle">' + esc(x.title) + '</span>'
+            + '<span class="lbtns"><button class="lbtn" onclick="openIncident(' + i + ')">자세히</button>'
+            + '<button class="lbtn ok" onclick="ackIncident(' + i + ', true)">확인함</button></span></div>';
+        }).join('');
+  } else {
+    el.className = 'lamp green';
+    var t = TODAY ? ('오늘 공격 시도 ' + TODAY.attempts + '건 — 사고 의심 0건'
+                     + (TODAY.attempts ? ' (그중 차단·거절 ' + TODAY.blocked + '건)' : '')) : '사고 의심 0건';
+    el.innerHTML = '<div class="lhead"><span class="ldot"></span><b>조치 필요 없음</b><span class="lsub">'
+      + esc(t) + '</span>' + hist + '</div>';
+  }
+}
+function incidentBody(x){
+  var rs = (x.reasons || []).map(function(r){ return '<li>' + esc(r) + '</li>'; }).join('');
+  return '<div class="kv">'
+    + '<div class="k">종류</div><div class="v">' + esc(INC_TYPE_KO[x.type] || x.type) + ' — ' + esc(x.title) + '</div>'
+    + '<div class="k">시각</div><div class="v ip">' + esc(x.ts) + '</div>'
+    + '<div class="k">IP</div><div class="v ip">' + esc(x.ip) + inBadge(x.ip) + '</div>'
+    + ipDetailRows(x.ip)
+    + '<div class="k">요청</div><div class="v path">' + esc(x.method) + ' ' + esc(x.path) + ' → ' + esc(x.status) + '</div>'
+    + '</div>'
+    + '<div class="rec"><h4>왜 사고로 봤나</h4><ul>' + rs + '</ul>'
+    + '<h4>지금 할 일</h4><div>' + esc(x.advice) + '</div></div>';
+}
+function openIncident(i){
+  var x = INCIDENTS[i]; if(!x){ return; }
+  HISTORY_OPEN = false; DELETED_OPEN = false;
+  showModal('🔴 사고 의심 — 확인 필요', incidentBody(x)
+    + '<div class="actions">'
+    + '<button class="actbtn unblock" onclick="ackIncident(' + i + ', true)">✅ 확인함(처리 완료)</button>'
+    + (isLocalIp(x.ip) ? '' : '<button class="actbtn temp" onclick="doBlock(&#39;' + esc(x.ip) + '&#39;,&#39;ip&#39;,0)">🚫 이 IP 차단</button>')
+    + '<button class="actbtn evic" onclick="doEvidence(&#39;' + esc(x.ip) + '&#39;)">💾 증거 저장</button>'
+    + '<div class="ahint">확인함은 지우는 게 아니에요 — 사고 기록에서 다시 열 수 있어요</div></div>', false);
+}
+function ackIncident(i, flag){
+  var x = INCIDENTS[i]; if(!x){ return; }
+  postJSON('/api/incident/ack', {key: x.key, ack: flag}).then(function(res){
+    showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''),
+      res.ok ? function(){ postJSON('/api/incident/ack', {key: x.key, ack: !flag}).then(function(){ tick(); }); } : null);
+    afterAction();
+  });
+}
+function openIncidentHistory(){
+  HISTORY_OPEN = false; DELETED_OPEN = false;
+  showModal('📕 사고 기록', '<div class="hempty">불러오는 중…</div>', true);
+  fetch('/api/incidents', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){ INCHIST = d.rows || []; renderIncidentHistory(); })
+    .catch(function(){ document.getElementById('m-body').innerHTML = '<div class="hempty">불러오지 못했어요.</div>'; });
+}
+function renderIncidentHistory(){
+  if(!INCHIST.length){
+    document.getElementById('m-body').innerHTML = '<div class="hempty">사고 의심 기록이 없어요 👍 (막힌 공격은 여기 오지 않아요)</div>';
+    return;
+  }
+  document.getElementById('m-body').innerHTML =
+    '<div class="disc">성공 응답을 받은 공격과 수상한 로그인 성공만 모아요. 막힌 시도는 타임라인에 있어요.</div>'
+    + '<div class="hscroll"><table class="ltab"><thead><tr><th>시각</th><th>종류</th><th>IP</th><th>내용</th><th>상태</th><th></th></tr></thead><tbody>'
+    + INCHIST.map(function(x, i){
+        return '<tr><td class="mono">' + esc(fmtTs(x.ts)) + '</td><td>' + esc(INC_TYPE_KO[x.type] || x.type) + '</td>'
+          + '<td class="mono">' + esc(x.ip) + whereHtml(x.ip) + '</td><td class="why">' + esc(x.title) + '</td>'
+          + '<td>' + (x.ack ? '<span class="lv watch">확인함</span>' : '<span class="lv alert">확인 필요</span>') + '</td>'
+          + '<td style="white-space:nowrap"><button class="lbtn" onclick="histIncident(' + i + ')">자세히</button> '
+          + '<button class="lbtn" onclick="histAck(' + i + ')">' + (x.ack ? '다시 열기' : '확인함') + '</button></td></tr>';
+      }).join('') + '</tbody></table></div>';
+}
+function histIncident(i){
+  var x = INCHIST[i]; if(!x){ return; }
+  showModal('📕 사고 기록 — ' + esc(INC_TYPE_KO[x.type] || x.type), incidentBody(x)
+    + '<div class="actions"><button class="actbtn" onclick="openIncidentHistory()">← 목록으로</button></div>', false);
+}
+function histAck(i){
+  var x = INCHIST[i]; if(!x){ return; }
+  postJSON('/api/incident/ack', {key: x.key, ack: !x.ack}).then(function(res){
+    showUndo((res.ok ? '✅ ' : '⚠ ') + (res.message || ''), null);
+    openIncidentHistory(); tick();
+  });
+}
 function showUndo(msg, undoFn){
   var t = document.getElementById('toast');
   t.innerHTML = '<span>' + esc(msg) + '</span>' + (undoFn ? '<button id="undoBtn">실행 취소</button>' : '');
@@ -2846,6 +3150,25 @@ def run_dashboard(a):
                 else:
                     timeline = build_timeline(events, 60)     # DB 없으면 현재 로그에서
                 payload = build_dashboard_payload(results, dist, timeline)
+                # '뚫렸나?' — 실제 사고일 수 있는 것만(출처 정보가 오면 다음 차례에 다시 판단)
+                with lock:
+                    ipcache = dict(state["ipinfo"])
+                incs = detect_incidents(events, ipcache, a.auth_threshold)
+                if conn is not None:
+                    fresh_incs = store_incidents(conn, incs)
+                    payload["incidents"] = load_incidents(conn, open_only=True, limit=50)
+                    payload["today"] = today_summary(conn=conn)
+                else:
+                    with lock:
+                        mem = state.setdefault("mem_incidents", {})
+                        fresh_incs = [i for i in incs if i["key"] not in mem]
+                        for i in fresh_incs:
+                            mem[i["key"]] = dict(i, ack=False, ack_at="", found_at=datetime.now().isoformat(timespec="seconds"))
+                        payload["incidents"] = [v for v in mem.values() if not v["ack"]][-50:][::-1]
+                    payload["today"] = today_summary(events=events)
+                payload["logins"] = recent_logins(events)
+                with lock:
+                    state["fresh_incidents"] = state.get("fresh_incidents", []) + fresh_incs   # 알림용(2단계)
             except Exception as e:  # noqa: BLE001 — 한 번 실패해도 상황판은 멈추지 않는다
                 print(f"⚠ 재검사 실패(무시하고 계속): {e}")
                 payload = None
@@ -2936,6 +3259,19 @@ def run_dashboard(a):
                 # 조치 기록 화면 — 요청마다 자기 DB 연결을 열고 닫는다(SQLite 스레드 규칙)
                 body = json.dumps(load_history(a.db), ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
+            elif self.path.startswith("/api/incidents"):
+                if a.db:
+                    try:
+                        _c = open_db(a.db)
+                        rows = load_incidents(_c, open_only=False, limit=300)
+                        _c.close()
+                    except Exception:  # noqa: BLE001
+                        rows = []
+                else:
+                    with lock:
+                        rows = sorted(state.get("mem_incidents", {}).values(), key=lambda x: x["ts"], reverse=True)
+                body = json.dumps({"rows": rows}, ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
             elif self.path.startswith("/api/deleted"):
                 body = json.dumps(load_deleted(a.db), ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
@@ -2948,7 +3284,8 @@ def run_dashboard(a):
             if self.path not in ("/api/block", "/api/unblock", "/api/evidence",
                                  "/api/trust", "/api/untrust",
                                  "/api/log/delete", "/api/log/restore", "/api/log/purge",
-                                 "/api/log/delete_many", "/api/log/restore_many"):
+                                 "/api/log/delete_many", "/api/log/restore_many",
+                                 "/api/incident/ack"):
                 self._send(404, b"not found", "text/plain; charset=utf-8")
                 return
             allowed, why = _post_allowed(self.headers, token)
@@ -3000,6 +3337,18 @@ def run_dashboard(a):
                 res = restore_logs(a.db, data)
             elif self.path == "/api/log/purge":
                 res = purge_logs(a.db, data)
+            elif self.path == "/api/incident/ack":
+                key = str(data.get("key") or "")
+                if a.db:
+                    res = ack_incident(a.db, key, bool(data.get("ack", True)))
+                else:
+                    with lock:
+                        mem = state.setdefault("mem_incidents", {})
+                        if key in mem:
+                            mem[key]["ack"] = bool(data.get("ack", True))
+                            res = {"ok": True, "message": "표시했습니다."}
+                        else:
+                            res = {"ok": False, "message": "해당 사고 기록이 없습니다."}
             elif self.path == "/api/log/delete_many":
                 res = delete_many(a.db, data.get("items"), 1)
             elif self.path == "/api/log/restore_many":
