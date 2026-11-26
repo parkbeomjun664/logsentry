@@ -940,5 +940,184 @@ class TestEdgeBlocked(unittest.TestCase):
         self.assertFalse(_timeline_entry("t", "", "1.2.3.4", "/", "POST", 499, "x", "의심 헤더")["edge_blocked"])
 
 
+class TestIpIntel(unittest.TestCase):
+    """[v3.12] 공격 IP 출처(나라·기관·종류) — 네트워크 없이 등록기관 응답 모양으로 시험."""
+
+    APNIC = {"country": "IN", "name": "EXAMPLE-IN", "startAddress": "27.100.38.0",
+             "endAddress": "27.100.38.255",
+             "remarks": [{"description": ["Example Web Hosting Pvt Ltd"]}],
+             "entities": [{"roles": ["registrant"],
+                           "vcardArray": ["vcard", [["version", {}, "text", "4.0"],
+                                                    ["fn", {}, "text", "Example Web Hosting Pvt Ltd"]]]}]}
+    ARIN = {"name": "MSFT", "handle": "NET-20-33-0-0-1",
+            "cidr0_cidrs": [{"v4prefix": "20.33.0.0", "length": 16}],
+            "entities": [{"roles": ["registrant"],
+                          "vcardArray": ["vcard", [["fn", {}, "text", "Microsoft Corporation"],
+                                                   ["adr", {"label": "One Microsoft Way\nRedmond\nWA\n98052\nUnited States"},
+                                                    "text", ["", "", "", "", "", "", ""]]]]}]}
+
+    def setUp(self):
+        import logsentry
+        self.ls = logsentry
+        self._trusted = logsentry._TRUSTED_IPS
+
+    def tearDown(self):
+        self.ls._TRUSTED_IPS = self._trusted
+
+    def test_parse_apnic_shape(self):
+        r = self.ls.parse_rdap(self.APNIC)
+        self.assertEqual(r["country"], "IN")
+        self.assertEqual(r["org"], "Example Web Hosting Pvt Ltd")
+        self.assertEqual(r["net"], "EXAMPLE-IN")
+        self.assertIn("27.100.38.0", r["cidr"])
+
+    def test_parse_arin_shape_country_from_label(self):
+        r = self.ls.parse_rdap(self.ARIN)
+        self.assertEqual(r["country"], "US")             # ARIN 은 주소 마지막 줄의 영어 나라 이름
+        self.assertEqual(r["cidr"], "20.33.0.0/16")
+        self.assertEqual(r["org"], "Microsoft Corporation")
+
+    def test_parse_real_ripe_shape_picks_org_not_person(self):
+        obj = {"name": "INFRAWATCH", "country": "GB",
+               "remarks": [{"description": ["-----------", "Real time internet intelligence data", "infrawat.ch"]}],
+               "entities": [
+                   {"roles": ["registrant"], "handle": "HYDRA-MNT",
+                    "vcardArray": ["vcard", [["fn", {}, "text", "HYDRA-MNT"], ["kind", {}, "text", "individual"]]]},
+                   {"roles": ["administrative", "technical"], "handle": "LD1-RIPE",
+                    "vcardArray": ["vcard", [["fn", {}, "text", "Person Name"], ["kind", {}, "text", "individual"]]]},
+                   {"roles": ["registrant"], "handle": "ORG-IL1-RIPE",
+                    "vcardArray": ["vcard", [["fn", {}, "text", "Infrawatch Limited"], ["kind", {}, "text", "org"]]]},
+                   {"roles": ["abuse"], "handle": "ACRO1-RIPE",
+                    "vcardArray": ["vcard", [["fn", {}, "text", "Abuse contact role object"], ["kind", {}, "text", "group"]]]}]}
+        r = self.ls.parse_rdap(obj)
+        self.assertEqual(r["org"], "Infrawatch Limited")            # 회사(org) 우선
+        self.assertEqual(r["descr"], "Real time internet intelligence data · infrawat.ch")   # 줄표 줄 버림
+        self.assertNotIn("Person Name", r["org"])                   # 개인 이름은 기관으로 안 씀
+        info = self.ls.lookup_ip("81.19.219.231", fetch=lambda u: obj, resolver=lambda ip: "")
+        self.assertNotIn("Person Name", json.dumps(info, ensure_ascii=False))   # 저장·화면에도 없음
+        self.assertNotIn("HYDRA-MNT", r["org"])                     # 관리자 코드도 아님
+        self.assertEqual(self.ls.classify_ip(r["org"], r["net"], r["descr"] + " " + r["extra"]), "scanner")
+
+    def test_parse_real_apnic_shape_skips_abuse_contact(self):
+        obj = {"name": "YouStable", "country": "IN",
+               "remarks": [{"description": ["YouStable"], "title": "description"}],
+               "entities": [
+                   {"roles": ["abuse"], "handle": "IRT-HSL-AP",
+                    "vcardArray": ["vcard", [["fn", {}, "text", "IRT-HSL-AP"], ["kind", {}, "text", "group"]]]},
+                   {"roles": ["technical", "administrative"], "handle": "QTPL2-AP",
+                    "vcardArray": ["vcard", [["fn", {}, "text", "Qloudin Technologies Pvt Ltd administrator"],
+                                             ["kind", {}, "text", "group"]]]}]}
+        r = self.ls.parse_rdap(obj)
+        self.assertEqual(r["org"], "YouStable")                     # 신고 창구(IRT) 이름이 아님
+        self.assertEqual(self.ls.classify_ip(r["org"], r["net"], r["descr"] + " " + r["extra"]), "cloud")
+
+    def test_afrinic_individual_role_used_only_for_kind(self):
+        obj = {"country": "CA", "entities": [
+            {"roles": ["administrative", "technical"], "handle": "CIS1-AFRINIC",
+             "vcardArray": ["vcard", [["fn", {}, "text", "Cloud Innovation Support"], ["kind", {}, "text", "individual"]]]}]}
+        info = self.ls.lookup_ip("45.194.92.57", fetch=lambda u: obj, resolver=lambda ip: "")
+        self.assertEqual(info["org"], "")                          # 표시·저장 안 함
+        self.assertEqual(info["kind"], "cloud")                    # 분류에는 참고
+
+    def test_parse_garbage_is_safe(self):
+        self.assertEqual(self.ls.parse_rdap("not json")["country"], "")
+        self.assertEqual(self.ls.parse_rdap({"entities": [{"vcardArray": "broken"}]})["org"], "")
+
+    def test_classify(self):
+        c = self.ls.classify_ip
+        self.assertEqual(c(rdns="scanner-12.ch1.censys-scanner.com"), "scanner")
+        self.assertEqual(c(org="Example Web Hosting Pvt Ltd"), "cloud")
+        self.assertEqual(c(org="Microsoft Corporation", net="MSFT"), "cloud")
+        self.assertEqual(c(org="KT Corporation"), "isp")
+        self.assertEqual(c(rdns="211-36-1-2.dynamic.example.net"), "isp")
+        self.assertEqual(c(org="Some Trading Company"), "unknown")
+        # 검색엔진이 클라우드보다 먼저(Censys 는 클라우드 대역에서도 돎)
+        self.assertEqual(c(org="Google LLC", rdns="x.censys-scanner.com"), "scanner")
+
+    def test_never_lookup_private_or_trusted(self):
+        f = self.ls._ip_lookupable
+        self.assertFalse(f("192.168.10.1"))
+        self.assertFalse(f("127.0.0.1"))
+        self.assertFalse(f("::1"))
+        self.assertFalse(f("not-an-ip"))
+        self.assertFalse(f("203.0.113.5"))              # 문서용 예약 대역도 공인이 아님
+        self.assertTrue(f("27.100.38.10"))
+        self.ls._TRUSTED_IPS = ("27.100.38.0/24",)
+        self.assertFalse(f("27.100.38.10"))              # 신뢰 대역은 밖에 묻지 않음
+
+    def test_lookup_private_makes_no_request(self):
+        calls = []
+        info = self.ls.lookup_ip("192.168.10.1", fetch=lambda u: calls.append(u), resolver=lambda ip: "x")
+        self.assertFalse(info["ok"])
+        self.assertEqual(calls, [])
+
+    def test_lookup_uses_bootstrap_and_normalized_url(self):
+        calls = []
+        boot = {"services": [[["27.0.0.0/8"], ["http://ignored/", "https://rdap.apnic.net/"]]]}
+
+        def fetch(url):
+            calls.append(url)
+            return self.APNIC
+        info = self.ls.lookup_ip("27.100.38.10", boot, fetch=fetch, resolver=lambda ip: "")
+        self.assertEqual(calls, ["https://rdap.apnic.net/ip/27.100.38.10"])   # https 주소만 사용
+        self.assertTrue(info["ok"])
+        self.assertEqual((info["country"], info["country_ko"], info["kind"]), ("IN", "인도", "cloud"))
+
+    def test_lookup_fetch_failure_falls_back_to_rdns(self):
+        def boom(url):
+            raise OSError("timeout")
+        info = self.ls.lookup_ip("27.100.38.10", fetch=boom, resolver=lambda ip: "scan.shodan.io")
+        self.assertTrue(info["ok"])                      # rDNS 만으로도 종류는 앎
+        self.assertEqual(info["kind"], "scanner")
+        info2 = self.ls.lookup_ip("27.100.38.10", fetch=boom, resolver=lambda ip: "")
+        self.assertFalse(info2["ok"])
+        self.assertIn("timeout", info2["error"])
+
+    def test_rdap_base_fallback(self):
+        self.assertEqual(self.ls.rdap_base("8.8.8.8", {"services": []}), self.ls._RDAP_FALLBACK)
+        self.assertEqual(self.ls.rdap_base("8.8.8.8", None), self.ls._RDAP_FALLBACK)
+
+    def test_pick_targets_respects_cache_and_privacy(self):
+        import time as _t
+        now = _t.time()
+        fresh = datetime.fromtimestamp(now - 60).isoformat(timespec="seconds")
+        old_fail = datetime.fromtimestamp(now - 7200).isoformat(timespec="seconds")
+        payload = {"timeline": [{"ip": "192.168.10.1"}, {"ip": "27.100.38.10"}, {"ip": "8.8.8.8"},
+                                {"ip": "1.1.1.1"}],
+                   "alerts": [{"ip": "9.9.9.9"}], "top_ips": [{"ip": "8.8.8.8"}]}
+        cache = {"27.100.38.10": {"ok": True, "looked_at": fresh},     # 최근 성공 → 다시 안 물음
+                 "1.1.1.1": {"ok": False, "looked_at": old_fail}}      # 2시간 전 실패 → 다시 물음
+        got = self.ls.pick_lookup_targets(payload, cache, now, limit=5)
+        self.assertEqual(got, ["8.8.8.8", "1.1.1.1", "9.9.9.9"])     # 사설 제외·중복 제거·화면 순서
+        self.assertEqual(len(self.ls.pick_lookup_targets(payload, {}, now, limit=2)), 2)
+
+    def test_db_roundtrip_and_view(self):
+        fd, p = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            conn = open_db(p)
+            info = self.ls.lookup_ip("27.100.38.10", fetch=lambda u: self.APNIC, resolver=lambda ip: "")
+            self.ls.save_ipinfo(conn, info)
+            loaded = self.ls.load_ipinfo(conn)
+            conn.close()
+            self.assertEqual(loaded["27.100.38.10"]["org"], "Example Web Hosting Pvt Ltd")
+            v = self.ls.ipinfo_view(loaded["27.100.38.10"])
+            self.assertEqual((v["kind_label"], v["kind_short"]), ("클라우드·호스팅", "호스팅"))
+            self.assertNotIn("error", v)                 # 내부 오류 문구는 화면에 안 보냄
+        finally:
+            os.remove(p)
+
+    def test_config_switch(self):
+        fd, p = tempfile.mkstemp(suffix=".json"); os.close(fd)
+        before = self.ls._IP_LOOKUP
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"ip_lookup": True}, f)
+            load_config(p)
+            self.assertTrue(self.ls._IP_LOOKUP)
+        finally:
+            self.ls._IP_LOOKUP = before
+            os.remove(p)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

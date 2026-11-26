@@ -72,6 +72,8 @@ _BRAND = "LogSentry"
 # 화면 로고(선택) — 설정 "brand_logo" = 이미지 파일 경로 또는 data: URI. 비우면 기본 방패.
 # 회사 로고는 설정 파일로만 넣는다(공개 저장소엔 안 올라감).
 _BRAND_LOGO = ""
+# 공격 IP 출처 조회(RDAP·역방향 이름) — 외부로 IP 를 묻는 기능이라 설정 "ip_lookup": true 일 때만 켠다
+_IP_LOOKUP = False
 # 신뢰 IP(회사·사내 공유 IP 등) — 경보에서 제외해 오탐을 줄인다. "192.168.10.0/24" 같은 대역도 된다.
 # ⚠ 통신사(LTE) IP 는 여러 사람이 함께 쓰므로 넣지 말 것.
 _TRUSTED_IPS = ()
@@ -95,7 +97,7 @@ def load_config(path):
     코드를 고치지 않고 회사마다 탐침 경로·도구 지문·신뢰 IP·문턱을 바꾸게 한다.
     파일이 없거나 읽기 실패하면 조용히 기본값을 쓴다(도구가 멈추지 않게).
     """
-    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS, _BRAND, _BRAND_LOGO
+    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS, _BRAND, _BRAND_LOGO, _IP_LOOKUP
     thresholds = dict(DEFAULT_THRESHOLDS)
     thresholds["webhook"] = ""   # 알림 웹훅 주소(선택) — 설정 파일로 덮어씀
     if not path or not os.path.exists(path):
@@ -128,6 +130,8 @@ def load_config(path):
         _BRAND = str(cfg["brand"]).strip()
     if "brand_logo" in cfg:
         _BRAND_LOGO = str(cfg["brand_logo"]).strip()
+    if "ip_lookup" in cfg:
+        _IP_LOOKUP = bool(cfg["ip_lookup"])
     if "webhook" in cfg:
         thresholds["webhook"] = cfg["webhook"]
     thresholds.update(cfg.get("thresholds", {}))
@@ -797,6 +801,10 @@ def open_db(path):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS trusted("
         "ip TEXT PRIMARY KEY, added_at TEXT)")
+    # 공격 IP 출처 조회 결과(나라·기관·종류) — 한 번 물은 IP 는 다시 안 묻게 저장
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ip_info("
+        "ip TEXT PRIMARY KEY, data TEXT, looked_at TEXT)")
     # 소프트 삭제 — 화면에서 지워도 바로 안 없애고 '삭제함'으로 옮겨 복구할 수 있게.
     # 이미 쓰던 DB 에도 칸을 더한다(없을 때만). 기존 행은 deleted=0(안 지움).
     cols = {r[1] for r in conn.execute("PRAGMA table_info(intrusion)")}
@@ -1345,6 +1353,297 @@ def print_db(path, limit):
     conn.close()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# 공격 IP 출처 분석 — "어디서 왔고, 어떤 종류의 IP 인가"
+#   · 출처: 인터넷 주소 공식 등록기관(RIR: APNIC·ARIN·RIPE…)의 RDAP 조회 → 나라·기관·네트워크 이름
+#   · 종류: 기관 이름 + 역방향 이름(rDNS)을 규칙으로 분류(클라우드·호스팅 / 보안 검색엔진 / 통신사·가정)
+#   · 외부로 IP 를 묻는 기능이라 설정 "ip_lookup": true 일 때만. 사내·사설·신뢰 IP 는 절대 조회 안 함.
+#   · 등록 정보는 IP 주인이 적는 글이라 믿으면 안 됨 → 길이 자르고, 화면에선 반드시 이스케이프.
+# ──────────────────────────────────────────────────────────────────────────
+_RDAP_BOOTSTRAP = {"v4": "https://data.iana.org/rdap/ipv4.json",
+                   "v6": "https://data.iana.org/rdap/ipv6.json"}
+_RDAP_FALLBACK = "https://rdap.org/"       # 부트스트랩을 못 받으면 쓰는 중계(알맞은 RIR 로 넘겨 줌)
+_IPINFO_OK_TTL = 30 * 86400                # 조회 성공 결과는 30일 재사용
+_IPINFO_FAIL_TTL = 3600                    # 실패는 1시간 뒤 다시 시도
+
+_COUNTRY_KO = {
+    "KR": "한국", "US": "미국", "CN": "중국", "JP": "일본", "RU": "러시아", "DE": "독일", "NL": "네덜란드",
+    "GB": "영국", "FR": "프랑스", "IN": "인도", "SG": "싱가포르", "HK": "홍콩", "TW": "대만", "VN": "베트남",
+    "BR": "브라질", "CA": "캐나다", "AU": "호주", "ID": "인도네시아", "TH": "태국", "PH": "필리핀",
+    "MY": "말레이시아", "UA": "우크라이나", "PL": "폴란드", "RO": "루마니아", "BG": "불가리아", "TR": "튀르키예",
+    "IR": "이란", "IT": "이탈리아", "ES": "스페인", "SE": "스웨덴", "CH": "스위스", "FI": "핀란드", "LT": "리투아니아",
+    "LV": "라트비아", "MD": "몰도바", "SC": "세이셸", "BZ": "벨리즈", "PA": "파나마", "ZA": "남아프리카공화국",
+    "MX": "멕시코", "AR": "아르헨티나", "CL": "칠레", "EG": "이집트", "IL": "이스라엘", "AE": "아랍에미리트",
+    "SA": "사우디아라비아", "PK": "파키스탄", "BD": "방글라데시", "KZ": "카자흐스탄", "CZ": "체코", "AT": "오스트리아",
+    "BE": "벨기에", "DK": "덴마크", "NO": "노르웨이", "IE": "아일랜드", "PT": "포르투갈", "GR": "그리스", "HU": "헝가리",
+    "EE": "에스토니아", "NG": "나이지리아", "KE": "케냐", "MN": "몽골", "KH": "캄보디아", "NZ": "뉴질랜드",
+}
+# ARIN 은 나라 코드를 따로 안 주고 주소 글(label) 마지막 줄에 영어 나라 이름을 적는다
+_COUNTRY_EN = {"united states": "US", "canada": "CA", "puerto rico": "PR", "jamaica": "JM", "bahamas": "BS"}
+
+# 분류 규칙 — 앞에서부터 먼저 맞는 것으로. (키, 화면 이름, 짧은 이름, 설명)
+_IP_KINDS = {
+    "scanner": ("보안 검색엔진", "검색엔진",
+                "인터넷 전체를 훑는 연구·검색 서비스(Censys·Shodan 등). 대체로 무해한 정찰 — 무시하거나 막아도 됨."),
+    "cloud": ("클라우드·호스팅", "호스팅",
+              "돈 내고 빌린 서버. 공격 봇·스캐너가 가장 많이 쓰는 곳 — 같은 IP 가 반복하면 차단 1순위."),
+    "isp": ("통신사·가정 회선", "통신사",
+            "일반 가정·휴대폰 인터넷. 감염된 PC·공유기일 수 있음 — 같은 통신사 고객(직원 포함)이 섞이므로 대역 차단은 금지."),
+    "unknown": ("분류 안 됨", "미분류",
+                "등록 정보만으로는 판단이 어려움 — 무엇을 노렸는지(행동)로 판단하세요."),
+}
+_SCANNER_WORDS = ("censys", "shodan", "shadowserver", "binaryedge", "rapid7", "onyphe", "leakix", "criminalip",
+                  "stretchoid", "internet-measurement", "internet measurement", "recyber", "netsystemsresearch",
+                  "internettl", "alphastrike", "scanner", "security research", "intrinsec", "bitsight",
+                  "internet intelligence", "intelligence data", "infrawatch", "driftnet", "palo alto networks",
+                  "expanse", "modat", "fofa", "zoomeye", "quadmetrics", "cyber security research")
+_CLOUD_WORDS = ("amazon", "aws", "google", "microsoft", "azure", "digitalocean", "digital ocean", "ovh", "hetzner",
+                "linode", "akamai", "vultr", "choopa", "contabo", "alibaba", "aliyun", "tencent", "oracle", "scaleway",
+                "leaseweb", "m247", "hostinger", "ionos", "kamatera", "hosting", "datacenter", "data center",
+                "data-center", "colocation", "dedicated", "vps", "cloud", "server", "web services", "compute",
+                "host ", "hostroyale", "pfcloud", "frantech", "buyvm", "psychz", "quadranet", "servers",
+                "youstable", "qloudin", "hostwinds", "netcup", "ponynet", "colocrossing", "racknerd",
+                "dedipath", "aeza", "stark industries", "serverion", "hostkey", "cloud innovation",
+                "tencent cloud", "huawei cloud", "ucloud", "kaopu", "gcore", "zenlayer")
+_ISP_WORDS = ("telecom", "telekom", "telecommunication", "broadband", "mobile", "cellular", "wireless",
+              "kt corp", "korea telecom", "sk broadband", "lg dacom", "lg uplus", "lg powercomm", "comcast",
+              "verizon", "at&t", "charter", "spectrum", "cable", "dsl", "fiber", "fibre", "internet service",
+              "vodafone", "orange", "telefonica", "chinanet", "china unicom", "china telecom", "china mobile",
+              "reliance jio", "airtel", "bsnl", "viettel", "vnpt", "telkom", "pldt", "rostelecom",
+              "dynamic", "dhcp", "pool", "ppp", "residential", "customer")
+
+
+def _ip_lookupable(ip):
+    """밖에 물어봐도 되는 IP 인가 — 인터넷 공인 주소만(사설·루프백·예약·신뢰 IP 는 절대 안 물음)."""
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return False
+    return addr.is_global and not _is_trusted(str(addr))
+
+
+def _clip(v, n=120):
+    """등록 정보 글은 IP 주인이 아무렇게나 적을 수 있다 → 문자열로, 줄바꿈 없애고, 길이 제한."""
+    return " ".join(str(v or "").split())[:n]
+
+
+def _vcard_get(entity, field):
+    """RDAP entity 의 vCard 에서 필드 하나(fn·adr 등)를 꺼낸다. 없으면 None."""
+    try:
+        for item in entity.get("vcardArray", [None, []])[1]:
+            if item and item[0] == field:
+                return item
+    except (AttributeError, IndexError, TypeError):
+        return None
+    return None
+
+
+def _walk_entities(obj, depth=0):
+    """entities 는 안에 entities 를 또 품을 수 있다(2단계까지만 훑음)."""
+    for ent in (obj.get("entities") or []):
+        if isinstance(ent, dict):
+            yield ent
+            if depth < 1:
+                yield from _walk_entities(ent, depth + 1)
+
+
+def parse_rdap(obj):
+    """RDAP 응답(JSON) → {country, org, net, cidr, descr}. RIR 마다 모양이 조금씩 달라 여러 곳을 본다."""
+    if not isinstance(obj, dict):
+        return {"country": "", "org": "", "net": "", "cidr": "", "descr": "", "extra": ""}
+    country = str(obj.get("country") or "").upper()[:2]
+    net = _clip(obj.get("name") or obj.get("handle"), 60)
+    # 대역: cidr0 확장(있으면) → 아니면 시작~끝 주소
+    cidr = ""
+    for c in (obj.get("cidr0_cidrs") or []):
+        if isinstance(c, dict) and (c.get("v4prefix") or c.get("v6prefix")):
+            cidr = f"{c.get('v4prefix') or c.get('v6prefix')}/{c.get('length')}"
+            break
+    if not cidr and obj.get("startAddress"):
+        cidr = f"{obj.get('startAddress')} ~ {obj.get('endAddress')}"
+    # 설명(RIPE·APNIC 의 descr 가 remarks 로 옴) — 기관 이름이 여기 있을 때가 많다
+    descr = ""
+    for r in (obj.get("remarks") or []):
+        if isinstance(r, dict) and r.get("description"):
+            lines = [str(x).strip() for x in r["description"] if any(ch.isalnum() for ch in str(x))]
+            if lines:
+                descr = _clip(" · ".join(lines[:2]), 120)
+                break
+    # 기관: 등록자(registrant) 역할의 이름이 우선, 없으면 아무 entity 의 이름
+    org_kind, registrant, group, extra = "", "", "", []
+    for ent in _walk_entities(obj):
+        fn = _vcard_get(ent, "fn")
+        name = _clip(fn[3], 100) if fn and len(fn) > 3 else ""
+        kind_item = _vcard_get(ent, "kind")
+        vkind = str(kind_item[3]).lower() if kind_item and len(kind_item) > 3 else ""
+        roles = ent.get("roles") or []
+        handle = str(ent.get("handle") or "")
+        # 신고 창구(abuse)·관리자 코드(-MNT)는 쓰지 않는다. 개인(individual) 표시 이름은
+        # 화면·저장에 절대 안 쓰고 '종류 분류'에만 참고(AFRINIC 은 회사 창구도 individual 로 적음).
+        if not name or "abuse" in roles or handle.upper().endswith("-MNT"):
+            continue
+        extra.append(name)
+        if vkind == "individual":
+            continue
+        if vkind == "org" and not org_kind:
+            org_kind = name
+        elif "registrant" in roles and not registrant:
+            registrant = name
+        elif not group:
+            group = re.sub(r"\s+(administrator|admin|technical|tech|noc)$", "", name, flags=re.I)
+        if not country:   # vCard 주소에서 나라 찾기(cc 매개변수 또는 ARIN 의 label 마지막 줄)
+            adr = _vcard_get(ent, "adr")
+            if adr and isinstance(adr[1], dict):
+                cc = str(adr[1].get("cc") or "").upper()
+                label = str(adr[1].get("label") or "")
+                if cc:
+                    country = cc[:2]
+                elif label:
+                    country = _COUNTRY_EN.get(label.strip().splitlines()[-1].strip().lower(), "")
+    org = org_kind or registrant or descr or group
+    return {"country": country, "org": org, "net": net, "cidr": _clip(cidr, 60), "descr": descr,
+            "extra": _clip(" ".join(extra), 200)}
+
+
+def classify_ip(org="", net="", descr="", rdns=""):
+    """등록 정보·역방향 이름 → 종류 키(scanner/cloud/isp/unknown). 검색엔진 > 클라우드 > 통신사 순."""
+    text = " " + " ".join([org, net, descr, rdns]).lower().replace("_", " ") + " "
+    if any(w in text for w in _SCANNER_WORDS):
+        return "scanner"
+    if any(w in text for w in _CLOUD_WORDS):
+        return "cloud"
+    if any(w in text for w in _ISP_WORDS):
+        return "isp"
+    return "unknown"
+
+
+def _http_json(url, timeout=8):
+    """RDAP·부트스트랩 JSON 받기. 신원은 일반 이름만 보냄(회사·사람 정보 없음)."""
+    req = urllib.request.Request(url, headers={"Accept": "application/rdap+json, application/json",
+                                               "User-Agent": "InfoGuard-IDS/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:   # noqa: S310 — https 고정 주소만
+        return json.loads(r.read(2_000_000).decode("utf-8", "replace"))
+
+
+def _rdns(ip, timeout=3):
+    """역방향 이름(예: scanner-01.censys-scanner.com). 느린 DNS 에 묶이지 않게 시간 제한."""
+    import socket
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TO
+    ex = ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(socket.gethostbyaddr, ip)
+    try:
+        return _clip(fut.result(timeout=timeout)[0], 100)
+    except (_TO, OSError, IndexError, UnicodeError):
+        return ""
+    finally:
+        ex.shutdown(wait=False)
+
+
+def rdap_base(ip, bootstrap):
+    """IANA 부트스트랩(어느 대역을 어느 RIR 이 관리하는지) → 이 IP 를 물어볼 RDAP 주소."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        for entry in (bootstrap or {}).get("services", []):
+            prefixes, urls = entry[0], entry[1]
+            for pfx in prefixes:
+                try:
+                    if addr in ipaddress.ip_network(pfx, strict=False):
+                        https = [u for u in urls if u.startswith("https://")]
+                        return (https or urls)[0]
+                except ValueError:
+                    continue
+    except (ValueError, TypeError, IndexError, AttributeError):
+        pass
+    return _RDAP_FALLBACK
+
+
+def lookup_ip(ip, bootstrap=None, fetch=_http_json, resolver=_rdns):
+    """IP 하나의 출처·종류. 네트워크 함수는 바꿔 끼울 수 있게(시험은 오프라인으로)."""
+    now = datetime.now().isoformat(timespec="seconds")
+    info = {"ip": ip, "ok": False, "country": "", "country_ko": "", "org": "", "net": "", "cidr": "",
+            "rdns": "", "kind": "unknown", "looked_at": now, "error": ""}
+    if not _ip_lookupable(ip):
+        info["error"] = "조회 대상 아님(사설·신뢰·잘못된 주소)"
+        return info
+    ip = str(ipaddress.ip_address(ip))            # 정규화된 주소만 URL 에 넣는다
+    try:
+        base = rdap_base(ip, bootstrap)
+        parsed = parse_rdap(fetch(base.rstrip("/") + "/ip/" + urllib.parse.quote(ip, safe=":.")))
+        info.update({k: parsed[k] for k in ("country", "org", "net", "cidr")})
+        info["ok"] = True
+    except Exception as e:  # noqa: BLE001 — 조회 실패는 표시만 하고 넘어간다
+        parsed = {"descr": "", "extra": ""}
+        info["error"] = _clip(f"{type(e).__name__}: {e}", 100)
+    info["rdns"] = resolver(ip) if resolver else ""
+    info["country_ko"] = _COUNTRY_KO.get(info["country"], info["country"])
+    info["kind"] = classify_ip(info["org"], info["net"],
+                               parsed.get("descr", "") + " " + parsed.get("extra", ""), info["rdns"])
+    if info["rdns"] and not info["ok"]:
+        info["ok"] = True                          # RDAP 은 실패해도 rDNS 로 종류는 알 수 있음
+    return info
+
+
+def ipinfo_view(info):
+    """화면에 보낼 모양 — 종류 이름·설명을 붙인다."""
+    kind = info.get("kind") or "unknown"
+    label, short, note = _IP_KINDS.get(kind, _IP_KINDS["unknown"])
+    out = {k: info.get(k, "") for k in ("ip", "ok", "country", "country_ko", "org", "net", "cidr", "rdns",
+                                        "looked_at")}
+    out.update({"kind": kind, "kind_label": label, "kind_short": short, "kind_note": note})
+    return out
+
+
+def _ipinfo_fresh(info, now_ts):
+    """다시 물을 필요가 없는가 — 성공은 30일, 실패는 1시간 동안 재사용."""
+    try:
+        age = now_ts - datetime.fromisoformat(info.get("looked_at", "")).timestamp()
+    except (ValueError, TypeError):
+        return False
+    return age < (_IPINFO_OK_TTL if info.get("ok") else _IPINFO_FAIL_TTL)
+
+
+def payload_ips(payload):
+    """화면에 보이는 IP 들(타임라인 최근 순 → 경보 → Top). 조회 우선순위 그대로."""
+    seen, out = set(), []
+    for src in (payload.get("timeline") or [], payload.get("alerts") or [], payload.get("top_ips") or []):
+        for row in src:
+            ip = row.get("ip")
+            if ip and ip not in seen:
+                seen.add(ip)
+                out.append(ip)
+    return out
+
+
+def pick_lookup_targets(payload, cache, now_ts, limit=5):
+    """이번 차례에 조회할 IP — 화면에 보이고, 물어도 되고, 저장된 결과가 오래됐거나 없는 것."""
+    out = []
+    for ip in payload_ips(payload):
+        if len(out) >= limit:
+            break
+        if not _ip_lookupable(ip):
+            continue
+        if ip in cache and _ipinfo_fresh(cache[ip], now_ts):
+            continue
+        out.append(ip)
+    return out
+
+
+def save_ipinfo(conn, info):
+    conn.execute("INSERT OR REPLACE INTO ip_info(ip, data, looked_at) VALUES(?,?,?)",
+                 (info["ip"], json.dumps(info, ensure_ascii=False), info.get("looked_at", "")))
+    conn.commit()
+
+
+def load_ipinfo(conn):
+    out = {}
+    for ip, data in conn.execute("SELECT ip, data FROM ip_info").fetchall():
+        try:
+            out[ip] = json.loads(data)
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 def build_dashboard_payload(results, dist, timeline=None):
     """탐지 결과(dict) → 화면이 읽을 JSON-안전 자료. '자료/보여주기 분리' 원칙 그대로.
 
@@ -1669,6 +1968,17 @@ _DASHBOARD_HTML = """<!doctype html>
   /* 앞단(Caddy)에서 거절된 공격 표시 */
   .badge.edge { background:rgba(46,160,67,.15); color:var(--green); border:1px solid rgba(46,160,67,.4);
                 font-weight:700; white-space:nowrap; }
+  /* 공격 IP 출처 꼬리표 — 종류별 색 */
+  .where { display:inline-block; margin-left:6px; padding:1px 8px; border-radius:10px; vertical-align:1px;
+           font:600 10.5px "Pretendard","Segoe UI",system-ui,sans-serif; white-space:nowrap;
+           background:var(--btn-bg); color:var(--muted); border:1px solid var(--border2); }
+  .where.k-cloud   { color:#d2a8ff; background:rgba(163,113,247,.12); border-color:rgba(163,113,247,.45); }
+  .where.k-scanner { color:#79c0ff; background:rgba(88,166,255,.10);  border-color:rgba(88,166,255,.40); }
+  .where.k-isp     { color:#56d4dd; background:rgba(57,197,207,.10);  border-color:rgba(57,197,207,.40); }
+  :root[data-theme="light"] .where.k-cloud   { color:#8250df; }
+  :root[data-theme="light"] .where.k-scanner { color:#0969da; }
+  :root[data-theme="light"] .where.k-isp     { color:#1b7c83; }
+  .knote { color:var(--muted); font-size:12px; }
   /* 여러 건 선택 삭제 */
   .chkcol { width:34px; text-align:center; padding-left:12px; }
   .rchk, #selall { width:15px; height:15px; cursor:pointer; accent-color:var(--accent); vertical-align:middle; }
@@ -1783,6 +2093,7 @@ function setStatus(ok, t){
 var LAST = [];          // 최근 타임라인(상세창·필터에서 꺼내 씀)
 var BLOCKED = [];       // 현재 차단 중인 IP 목록
 var TRUSTED = [];       // 신뢰(오탐 처리) IP 목록
+var IPINFO = {}, IP_LOOKUP = false;   // 공격 IP 출처(나라·기관·종류) — 설정 ip_lookup 일 때 서버가 채움
 var FILTER = '전체';    // 지금 고른 종류별 필터
 var KINDS = [];         // 탭에 뜬 종류 순서
 var SEARCH = '';        // 검색어(IP·경로·도구)
@@ -1809,6 +2120,7 @@ function render(d){
   ALERTS = d.alerts || [];
   BLOCKED = d.blocked || [];
   TRUSTED = d.trusted || [];
+  IPINFO = d.ipinfo || {}; IP_LOOKUP = !!d.ip_lookup;
   renderTop(d);
   renderBlocked();
   renderTrusted();
@@ -1826,7 +2138,7 @@ function renderTop(d){
     return '<div class="prow ' + (x.level === 'alert' ? 'alert' : '') + '" title="클릭=이 IP로 검색" '
       + 'onclick="onSearch(&#39;' + esc(x.ip) + '&#39;, true)">'
       + '<span class="bar" style="width:' + w + '%"></span>'
-      + '<span class="lbl">' + esc(x.ip) + inBadge(x.ip) + '</span><span class="cnt">' + x.count + '</span></div>';
+      + '<span class="lbl">' + esc(x.ip) + inBadge(x.ip) + whereHtml(x.ip) + '</span><span class="cnt">' + x.count + '</span></div>';
   }).join('') : '<div class="pempty">아직 없음 👍</div>';
   var pathRows = paths.length ? paths.map(function(x){
     var w = Math.max(6, Math.round(x.count / maxP * 100));
@@ -1914,7 +2226,7 @@ function renderRows(){
       + '<td class="chkcol"><input type="checkbox" class="rchk"' + chk
       + ' onclick="event.stopPropagation();toggleSel(' + i + ')"></td>'
       + '<td class="ip when">' + whenHtml(e) + '</td>'
-      + '<td class="ip">' + esc(e.ip) + inBadge(e.ip) + blk + '</td>'
+      + '<td class="ip">' + esc(e.ip) + inBadge(e.ip) + whereHtml(e.ip) + blk + '</td>'
       + '<td class="path">' + esc(e.path) + '</td>'
       + '<td>' + kpill + tool + '</td>'
       + '<td class="st">' + e.status + '</td>'
@@ -2005,6 +2317,29 @@ function postJSON(url, obj){
     .catch(function(){ return {ok:false, message:'요청 실패 — 서버 연결을 확인하세요.'}; });
 }
 // 사내·이 PC 주소인가 — 화면에 '사내' 표시(공격자로 오해하지 않게). 정규식 없이(파이썬 문자열 안이라 역슬래시 회피)
+// 공격 IP 출처 표시 — IP 옆 작은 꼬리표(나라 · 종류). 등록 정보는 남이 쓴 글이라 반드시 esc.
+function whereHtml(ip){
+  var i = IPINFO[ip];
+  if(!i || !i.ok){ return ''; }
+  var c = i.country_ko || i.country || '';
+  var t = (c ? c + ' · ' : '') + (i.kind_short || '');
+  var tip = [i.kind_label, i.org, i.net, i.rdns].filter(function(x){ return x; }).join(' · ');
+  return ' <span class="where k-' + esc(i.kind || 'unknown') + '" title="' + esc(tip) + '">' + esc(t) + '</span>';
+}
+// 상세창용 출처 줄들(출처·네트워크·역방향 이름·추정 유형)
+function ipDetailRows(ip){
+  if(isLocalIp(ip)){ return '<div class="k">출처</div><div class="v">사내·사설 주소 (밖에 조회하지 않음)</div>'; }
+  if(!IP_LOOKUP){ return ''; }
+  var i = IPINFO[ip];
+  if(!i){ return '<div class="k">출처</div><div class="v knote">조회 중… 잠시 뒤 다시 열어 보세요</div>'; }
+  if(!i.ok){ return '<div class="k">출처</div><div class="v knote">조회 실패 — 1시간 뒤 자동으로 다시 시도</div>'; }
+  var c = (i.country_ko || '') + (i.country ? ' (' + i.country + ')' : '');
+  return '<div class="k">출처</div><div class="v">' + esc(c || '나라 정보 없음') + (i.org ? ' · ' + esc(i.org) : '') + '</div>'
+    + '<div class="k">네트워크</div><div class="v ip">' + esc(i.net || '-') + (i.cidr ? ' · ' + esc(i.cidr) : '') + '</div>'
+    + (i.rdns ? '<div class="k">역방향 이름</div><div class="v ip">' + esc(i.rdns) + '</div>' : '')
+    + '<div class="k">추정 유형</div><div class="v"><span class="where k-' + esc(i.kind || 'unknown') + '">'
+    + esc(i.kind_label || '') + '</span> <span class="knote">' + esc(i.kind_note || '') + '</span></div>';
+}
 function isLocalIp(ip){
   ip = String(ip || '');
   if(ip === '::1' || ip.indexOf('fe80:') === 0 || ip.indexOf('fc') === 0 || ip.indexOf('fd') === 0){ return true; }
@@ -2202,7 +2537,7 @@ function openIpList(kind){
       + '<th>탐지 이유</th><th>마지막 공격</th><th></th></tr></thead><tbody>'
       + LISTROWS.map(function(r, i){
           var blk = BLOCKED.indexOf(r.ip) >= 0 ? ' <span class="badge blk">차단됨</span>' : '';
-          return '<tr><td class="mono">' + esc(r.ip) + inBadge(r.ip) + blk + '</td>'
+          return '<tr><td class="mono">' + esc(r.ip) + inBadge(r.ip) + whereHtml(r.ip) + blk + '</td>'
             + '<td><span class="lv ' + esc(r.level) + '">' + (LEVEL_KO[r.level] || esc(r.level)) + '</span></td>'
             + '<td>' + r.score + '</td><td>' + (r.reqs || 0) + '</td>'
             + '<td class="why">' + esc((r.reasons || []).join(' · ')) + '</td>'
@@ -2310,6 +2645,7 @@ function openDetail(i){
       '<div class="kv">'
     +   '<div class="k">시각</div><div class="v ip">' + esc(e.ts_iso || e.time) + '</div>'
     +   '<div class="k">공격자 IP</div><div class="v ip">' + esc(e.ip) + '</div>'
+    +   ipDetailRows(e.ip)
     +   '<div class="k">노린 경로</div><div class="v path">' + esc(e.method) + ' ' + esc(e.path) + '</div>'
     +   '<div class="k">상태코드</div><div class="v">' + e.status + '</div>'
     +   '<div class="k">유형</div><div class="v">' + esc(e.kind) + '</div>'
@@ -2466,6 +2802,14 @@ def run_dashboard(a):
              "blocked": load_blocked(a.db),                # 현재 차단 중인 IP(재시작해도 복원)
              "trusted": load_trusted(a.db)}                # 신뢰(오탐 처리) IP — 탐지에서 제외
     lock = threading.Lock()                                # 스레드 간 안전장치
+    state["ipinfo"] = {}                                   # 공격 IP 출처 조회 결과(ip → 정보)
+    if a.db and os.path.exists(a.db):
+        try:
+            _c = open_db(a.db)
+            state["ipinfo"] = load_ipinfo(_c)              # 예전에 조회한 결과 재사용
+            _c.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     if a.db:
         print(f"침투 흔적 DB: {a.db} (영구 저장)")
@@ -2473,6 +2817,8 @@ def run_dashboard(a):
         print(f"차단 중인 IP 복원: {len(state['blocked'])}개")
     if state["trusted"]:
         print(f"신뢰 IP 복원: {len(state['trusted'])}개")
+    if _IP_LOOKUP:
+        print(f"🌐 공격 IP 출처 조회 켜짐(RDAP·역방향 이름) — 저장된 결과 {len(state['ipinfo'])}개")
 
     def scanner():
         """백그라운드: scan_interval 초마다 로그를 다시 읽어 최신 경보로 갱신.
@@ -2508,6 +2854,45 @@ def run_dashboard(a):
                     state["payload"] = payload
             time.sleep(a.scan_interval)
 
+    def enricher():
+        """[출처 분석] 화면에 보이는 공격 IP 의 나라·기관·종류를 천천히 조회해 저장.
+
+        설정 "ip_lookup": true 일 때만 돈다. 한 차례 최대 5개·1.5초 간격·시간당 300개 —
+        등록기관 서버에 부담을 주지 않고, 상황판 갱신(scanner)과는 따로 돌아 화면이 느려지지 않는다.
+        """
+        conn = open_db(a.db) if a.db else None
+        bootstrap, boot_at = {}, 0.0
+        hour_start, hour_count = time.time(), 0
+        while True:
+            try:
+                now_ts = time.time()
+                if now_ts - hour_start > 3600:
+                    hour_start, hour_count = now_ts, 0
+                if now_ts - boot_at > 86400:                   # 어느 대역을 어느 등록기관이 맡는지(하루 1번)
+                    try:
+                        bootstrap = {"services": _http_json(_RDAP_BOOTSTRAP["v4"])["services"]
+                                     + _http_json(_RDAP_BOOTSTRAP["v6"])["services"]}
+                        boot_at = now_ts
+                    except Exception as e:  # noqa: BLE001
+                        print(f"⚠ RDAP 안내표 받기 실패 — 1시간 뒤 다시(그동안 rdap.org 중계 사용): {e}")
+                        bootstrap, boot_at = {}, now_ts - 86400 + 3600
+                with lock:
+                    payload = state["payload"]
+                    cache = dict(state["ipinfo"])
+                for ip in pick_lookup_targets(payload, cache, now_ts, limit=5):
+                    if hour_count >= 300:
+                        break
+                    info = lookup_ip(ip, bootstrap)
+                    hour_count += 1
+                    with lock:
+                        state["ipinfo"][ip] = info
+                    if conn is not None:
+                        save_ipinfo(conn, info)
+                    time.sleep(1.5)
+            except Exception as e:  # noqa: BLE001 — 조회가 실패해도 상황판은 멈추지 않는다
+                print(f"⚠ IP 출처 조회 실패(무시하고 계속): {e}")
+            time.sleep(5)
+
     # 켤 때마다 새로 만드는 비밀 표 — 진짜 화면에만 심어서, 조치 요청이 그 화면에서 왔는지 확인(CSRF 방지)
     token = secrets.token_urlsafe(24)
     page = (_DASHBOARD_HTML.replace("__LS_TOKEN__", token)
@@ -2537,6 +2922,9 @@ def run_dashboard(a):
                     resp = dict(state["payload"])                 # 얕은 복사 후
                     resp["blocked"] = sorted(state["blocked"])    # 현재 차단 목록을 끼워 보냄
                     resp["trusted"] = sorted(state["trusted"])    # 신뢰(오탐) 목록도
+                    resp["ip_lookup"] = _IP_LOOKUP                # 출처 조회 켜짐 여부
+                    resp["ipinfo"] = {ip: ipinfo_view(state["ipinfo"][ip])
+                                      for ip in payload_ips(resp) if ip in state["ipinfo"]}
                 body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
             elif self.path.startswith("/api/blocks"):
@@ -2625,6 +3013,8 @@ def run_dashboard(a):
             pass
 
     threading.Thread(target=scanner, daemon=True).start()   # 재검사 스레드 시작
+    if _IP_LOOKUP:
+        threading.Thread(target=enricher, daemon=True).start()   # 출처 조회 스레드(설정으로 켤 때만)
     srv = ThreadingHTTPServer((a.host, a.dashboard), Handler)
     print(f"실시간 상황판 시작 — http://{a.host}:{a.dashboard}"
           f"  ({a.scan_interval}초마다 재검사, Ctrl+C 로 중지)")
