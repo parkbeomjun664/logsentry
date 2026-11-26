@@ -8,6 +8,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -18,7 +19,7 @@ from logsentry import (LoginTracker, _block_refusal, _host_ok, _post_allowed, _i
                        analyze_logins, block_ip, build_dashboard_payload,
                        build_timeline, detect_distributed, export_evidence,
                        delete_logs, delete_many, edge_blocked, load_config, load_deleted, load_history, load_trusted, purge_logs, restore_logs, open_db, parse_line,
-                       recent_intrusions, recommend, send_webhook, store_events,
+                       recent_intrusions, recommend, is_tool, send_webhook, store_events,
                        trust_ip, unblock_ip, untrust_ip)
 
 # 기본 문턱(main 의 기본값과 같게)
@@ -1256,6 +1257,173 @@ class TestIncidents(unittest.TestCase):
             load_config(p)
             self.assertTrue(self.ls.is_secret_path("/internal-dump/a"))
             self.assertTrue(self.ls.is_secret_path("/.env"))                         # 기본 목록은 유지
+        finally:
+            os.remove(p)
+
+
+class TestNotifyAndHealth(unittest.TestCase):
+    """[v3.14] 알림·매일 요약·사이트/로그 감시 — 실제 발송 없이(가짜 발송기·로컬 시험 서버)."""
+
+    TG = {"bot_token": "123456789:AAEabcdefghijklmnopqrstuvwxyz012345", "chat_id": "42"}
+
+    def setUp(self):
+        import logsentry
+        self.ls = logsentry
+        self._n, self._h, self._auth = logsentry._NOTIFY, logsentry._HEALTH, logsentry._AUTH_PATHS
+
+    def tearDown(self):
+        self.ls._NOTIFY, self.ls._HEALTH, self.ls._AUTH_PATHS = self._n, self._h, self._auth
+
+    def test_channels(self):
+        f = self.ls.notify_channels
+        self.assertEqual(f({}), [])
+        self.assertEqual(f({"telegram": {"bot_token": "x"}}), [])            # chat_id 없으면 안 켜짐
+        self.assertEqual(f({"telegram": self.TG, "email": {"smtp_host": "h", "to": ["a@b"]}, "webhook": "u"}),
+                         ["텔레그램", "이메일", "웹훅"])
+
+    def test_one_channel_failing_does_not_stop_others(self):
+        sent = []
+
+        def bad_tg(tg, text):
+            raise RuntimeError("denied for token " + tg["bot_token"])
+        senders = {"telegram": bad_tg,
+                   "email": lambda em, subj, text: sent.append(("mail", subj)),
+                   "webhook": lambda url, text: sent.append(("hook", text))}
+        cfg = {"telegram": self.TG, "email": {"smtp_host": "h", "to": ["a@b"], "password": "pw123"},
+               "webhook": "https://hook"}
+        r = self.ls.send_notification("[InfoGuard] 제목줄\n본문", cfg=cfg, senders=senders)
+        self.assertEqual(r["이메일"], "ok")
+        self.assertEqual(r["웹훅"], "ok")
+        self.assertTrue(r["텔레그램"].startswith("실패"))
+        self.assertNotIn(self.TG["bot_token"], r["텔레그램"])                # 비밀값은 오류 문구에도 안 나옴
+        self.assertEqual(sent[0], ("mail", "[InfoGuard] 제목줄"))           # 첫 줄이 메일 제목
+
+    def test_bad_telegram_token_rejected_before_network(self):
+        with self.assertRaises(ValueError):
+            self.ls._send_telegram({"bot_token": "1/../../evil", "chat_id": "1"}, "x")
+
+    def test_incident_message(self):
+        self.ls._AUTH_PATHS = ("/api/auth/login",)
+        ev = [e for e in (parse_line(l) for l in [
+            nginx("27.100.38.10", "09:00:00", "GET", "/.env", 404, "Mozilla/5.0"),
+            nginx("27.100.38.10", "09:00:05", "POST", "/api/auth/login", 200, "Mozilla/5.0")]) if e]
+        inc = self.ls.detect_incidents(ev)[0]
+        msg = self.ls.fmt_incident_msg(inc, {"27.100.38.10": {"ok": True, "kind": "cloud", "country": "IN"}})
+        self.assertIn("🔴 확인 필요 — 수상한 로그인", msg)
+        self.assertIn("27.100.38.10 (인도 · 호스팅)", msg)
+        self.assertIn("할 일:", msg)
+
+    def test_daily_message(self):
+        base = {"date": "2026-11-26", "attempts": 142, "blocked": 120, "new_incidents": 0, "open_incidents": 0,
+                "top": [("27.100.38.10", 12, "인도 · 호스팅")], "kinds": [("권한 밖 경로", 39)], "health": {}}
+        m = self.ls.fmt_daily_msg(base)
+        self.assertIn("11/26 보안 요약", m)
+        self.assertIn("🟢 조치 필요 없음", m)
+        self.assertIn("공격 시도 142건 · 그중 차단·거절 120건", m)
+        self.assertIn("27.100.38.10(인도 · 호스팅) 12건", m)
+        self.assertTrue(m.splitlines()[-1].endswith("서버를 확인하세요)"))   # '살아 있다' 신호
+        m2 = self.ls.fmt_daily_msg(dict(base, open_incidents=2, health={"problems": ["사이트 응답 없음: x"]}))
+        self.assertIn("🔴 확인 필요 2건", m2)
+        self.assertIn("⚠ 감시 이상: 사이트 응답 없음: x", m2)
+
+    def test_daily_report_from_db(self):
+        fd, p = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            conn = open_db(p)
+            for k, (ip, st, kind) in enumerate([("1.1.1.1", 404, "없는 주소"), ("1.1.1.1", 401, "권한 밖 경로"),
+                                                ("8.8.8.8", 307, "도구 접근")]):
+                conn.execute("INSERT INTO intrusion(ts, ip, path, status, kind) VALUES(?,?,?,?,?)",
+                             (f"2026-11-26T09:00:0{k}+09:00", ip, "/x", st, kind))
+            conn.execute("INSERT INTO incident(key, ts, ip, type, data, ack) VALUES('k','2026-11-26T10:00:00','1.1.1.1','exposure','{}',0)")
+            conn.commit()
+            r = self.ls.daily_report(conn, "2026-11-26")
+            conn.close()
+            self.assertEqual((r["attempts"], r["blocked"], r["new_incidents"], r["open_incidents"]), (3, 2, 1, 1))
+            self.assertEqual(r["top"][0][:2], ("1.1.1.1", 2))
+        finally:
+            os.remove(p)
+
+    def test_health_monitor_alerts_only_on_change(self):
+        answers = iter([False, False, False, True, True])
+        mon = self.ls.HealthMonitor(["http://x"], fail_after=2, checker=lambda u: (next(answers), "d"))
+        self.assertEqual(mon.run(), [])                                     # 1번 실패 — 아직 아님
+        self.assertEqual(mon.run(), [("http://x", "down", "d")])           # 2번 연속 → 응답 없음
+        self.assertEqual(mon.run(), [])                                     # 같은 알림 반복 안 함
+        self.assertEqual(mon.problems(), ["사이트 응답 없음: http://x (d)"])
+        self.assertEqual(mon.run(), [("http://x", "up", "d")])             # 복구
+        self.assertEqual(mon.run(), [])
+        self.assertEqual(mon.problems(), [])
+
+    def test_log_stall(self):
+        fd, p = tempfile.mkstemp(suffix=".log"); os.close(fd)
+        try:
+            now = time.time()
+            os.utime(p, (now - 100 * 60, now - 100 * 60))
+            self.assertIn("100분째", self.ls.log_stall_problem(p, 90, now))
+            self.assertEqual(self.ls.log_stall_problem(p, 120, now), "")
+            self.assertEqual(self.ls.log_stall_problem(p, 0, now), "")     # 끔
+            self.assertIn("읽을 수 없음", self.ls.log_stall_problem(p + ".none", 90, now))
+        finally:
+            os.remove(p)
+
+    def test_daily_due(self):
+        f = self.ls.daily_due
+        self.assertFalse(f(datetime(2026, 11, 27, 8, 29), "08:30", ""))
+        self.assertTrue(f(datetime(2026, 11, 27, 8, 30), "08:30", "2026-11-26"))
+        self.assertFalse(f(datetime(2026, 11, 27, 9, 0), "08:30", "2026-11-27"))   # 오늘 이미 보냄
+        self.assertFalse(f(datetime(2026, 11, 27, 9, 0), "", ""))
+        self.assertFalse(f(datetime(2026, 11, 27, 9, 0), "아침", ""))
+
+    def test_meta_store(self):
+        fd, p = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            conn = open_db(p)
+            self.assertEqual(self.ls.get_meta(conn, "last_daily"), "")
+            self.ls.set_meta(conn, "last_daily", "2026-11-27")
+            self.assertEqual(self.ls.get_meta(conn, "last_daily"), "2026-11-27")
+            conn.close()
+        finally:
+            os.remove(p)
+
+    def test_check_url_against_local_server(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        seen = []
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                seen.append(self.headers.get("User-Agent"))
+                code = {"/ok": 200, "/nf": 404, "/err": 500}.get(self.path, 200)
+                self.send_response(code); self.send_header("Content-Length", "0"); self.end_headers()
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            self.assertTrue(self.ls.check_url(base + "/ok")[0])
+            self.assertTrue(self.ls.check_url(base + "/nf")[0])            # 404 라도 답하면 살아 있음
+            self.assertEqual(self.ls.check_url(base + "/err"), (False, "서버 오류 500"))   # 5xx = 고장
+        finally:
+            srv.shutdown()
+            srv.server_close()                                              # 소켓까지 닫아야 '꺼짐'
+        ok, why = self.ls.check_url(base + "/ok", timeout=2)
+        self.assertFalse(ok)                                                # 서버 꺼짐 = 응답 없음
+        # 윈도는 닫힌 포트를 '거부'로 알리기까지 ~2초 재시도 → 제한 시간에 따라 둘 중 하나(둘 다 쉬운 말)
+        self.assertIn(why, ("연결 거부(꺼져 있음)", "응답 시간 초과"))
+        self.assertEqual(seen[0], "InfoGuard-health/1.0")
+        self.assertFalse(is_tool(seen[0]))                                  # 감시 요청이 '도구 접근'으로 안 잡힘
+
+    def test_config_keys(self):
+        fd, p = tempfile.mkstemp(suffix=".json"); os.close(fd)
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"notify": {"telegram": self.TG, "daily_at": "08:00"},
+                           "health": {"urls": ["http://localhost:3000/"], "log_stall_minutes": 90}}, f)
+            load_config(p)
+            self.assertEqual(self.ls.notify_channels(), ["텔레그램"])
+            self.assertEqual(self.ls._HEALTH["log_stall_minutes"], 90)
         finally:
             os.remove(p)
 

@@ -33,7 +33,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # Windows 콘솔(cp949 등)에서 한글·이모지 출력이 깨지거나 터지지 않도록 UTF-8 로 맞춘다.
@@ -97,7 +97,7 @@ def load_config(path):
     코드를 고치지 않고 회사마다 탐침 경로·도구 지문·신뢰 IP·문턱을 바꾸게 한다.
     파일이 없거나 읽기 실패하면 조용히 기본값을 쓴다(도구가 멈추지 않게).
     """
-    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS, _BRAND, _BRAND_LOGO, _IP_LOOKUP, _SECRET_PATHS
+    global _TOOL_UA, _PROBE_PATHS, _SKIP, _TRUSTED_IPS, _AUTH_STATUSES, _AUTH_PATHS, _SUSPICIOUS_HEADERS, _BRAND, _BRAND_LOGO, _IP_LOOKUP, _SECRET_PATHS, _NOTIFY, _HEALTH
     thresholds = dict(DEFAULT_THRESHOLDS)
     thresholds["webhook"] = ""   # 알림 웹훅 주소(선택) — 설정 파일로 덮어씀
     if not path or not os.path.exists(path):
@@ -135,6 +135,10 @@ def load_config(path):
         _BRAND_LOGO = str(cfg["brand_logo"]).strip()
     if "ip_lookup" in cfg:
         _IP_LOOKUP = bool(cfg["ip_lookup"])
+    if isinstance(cfg.get("notify"), dict):          # 알림 채널(텔레그램·이메일·웹훅)·매일 요약 시각
+        _NOTIFY = dict(cfg["notify"])
+    if isinstance(cfg.get("health"), dict):          # 사이트 응답·로그 멈춤 감시
+        _HEALTH = dict(cfg["health"])
     if "webhook" in cfg:
         thresholds["webhook"] = cfg["webhook"]
     thresholds.update(cfg.get("thresholds", {}))
@@ -813,6 +817,8 @@ def open_db(path):
         "CREATE TABLE IF NOT EXISTS incident("
         "key TEXT PRIMARY KEY, ts TEXT, ip TEXT, type TEXT, data TEXT,"
         "ack INTEGER DEFAULT 0, ack_at TEXT, found_at TEXT)")
+    # 작은 상태 저장소(매일 요약을 오늘 보냈는지 등 — 재시작해도 두 번 안 보내게)
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
     # 소프트 삭제 — 화면에서 지워도 바로 안 없애고 '삭제함'으로 옮겨 복구할 수 있게.
     # 이미 쓰던 DB 에도 칸을 더한다(없을 때만). 기존 행은 deleted=0(안 지움).
     cols = {r[1] for r in conn.execute("PRAGMA table_info(intrusion)")}
@@ -1826,6 +1832,258 @@ def today_summary(conn=None, events=None, today=None):
     return {"date": day, "attempts": n, "blocked": b}
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# 알림 · 매일 요약 · 감시 상태 — "화면을 안 봐도 안심할 수 있게"
+#   · 즉시 알림: 사고 의심('뚫렸나?'), 사이트 응답 없음/복구, 로그 멈춤
+#   · 매일 요약: 어제 공격 시도·차단·많이 온 IP·확인 필요 건수 + "InfoGuard 정상 작동" (안 오면 감시가 멈춘 것)
+#   · 채널: 텔레그램 봇 / 이메일(SMTP) / 웹훅 — 설정 "notify" 에 넣은 것만. 하나가 실패해도 다른 건 보냄.
+#   · 비밀값(봇 토큰·메일 비밀번호)은 화면·로그·오류 문구에 절대 안 찍는다.
+# ──────────────────────────────────────────────────────────────────────────
+_NOTIFY = {}          # 설정 "notify": {"telegram": {...}, "email": {...}, "webhook": "...", "daily_at": "08:30"}
+_HEALTH = {}          # 설정 "health": {"urls": [...], "interval": 300, "fail_after": 2, "log_stall_minutes": 90}
+_HEALTH_UA = "InfoGuard-health/1.0"     # 도구 지문(curl·python-urllib 등)에 안 걸리는 이름 — 감시 요청이 공격으로 안 잡히게
+_TG_TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
+
+
+def notify_channels(cfg=None):
+    """설정된 알림 채널 이름들(화면 표시용 — 값은 안 내보냄)."""
+    cfg = _NOTIFY if cfg is None else cfg
+    out = []
+    tg = cfg.get("telegram") or {}
+    if tg.get("bot_token") and tg.get("chat_id"):
+        out.append("텔레그램")
+    em = cfg.get("email") or {}
+    if em.get("smtp_host") and em.get("to"):
+        out.append("이메일")
+    if cfg.get("webhook"):
+        out.append("웹훅")
+    return out
+
+
+def _scrub(msg, cfg):
+    """오류 문구에 비밀값이 섞여 나오지 않게 가린다."""
+    text = str(msg)
+    for secret in ((cfg.get("telegram") or {}).get("bot_token"), (cfg.get("email") or {}).get("password")):
+        if secret:
+            text = text.replace(str(secret), "***")
+    return _clip(text, 160)
+
+
+def _send_telegram(tg, text):
+    token = str(tg.get("bot_token") or "")
+    if not _TG_TOKEN_RE.match(token):            # 이상한 토큰이 주소에 섞여 엉뚱한 곳으로 가지 않게
+        raise ValueError("텔레그램 bot_token 형식이 올바르지 않습니다")
+    body = json.dumps({"chat_id": tg.get("chat_id"), "text": text[:3900],
+                       "disable_web_page_preview": True}).encode("utf-8")
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body, method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": _BRAND})
+    with urllib.request.urlopen(req, timeout=10) as r:   # noqa: S310 — 고정 https 주소
+        r.read()
+
+
+def _send_email(em, subject, text):
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = em.get("from") or em.get("username")
+    to = em.get("to")
+    msg["To"] = ", ".join(to) if isinstance(to, (list, tuple)) else str(to)
+    msg.set_content(text)
+    port = int(em.get("smtp_port") or 587)
+    ctx = ssl.create_default_context()
+    if port == 465:
+        server = smtplib.SMTP_SSL(em["smtp_host"], port, timeout=15, context=ctx)
+    else:
+        server = smtplib.SMTP(em["smtp_host"], port, timeout=15)
+        server.starttls(context=ctx)              # 비밀번호가 평문으로 가지 않게 항상 암호화
+    try:
+        if em.get("username"):
+            server.login(em["username"], em.get("password") or "")
+        server.send_message(msg)
+    finally:
+        server.quit()
+
+
+def _send_webhook_text(url, text):
+    req = urllib.request.Request(url, data=json.dumps({"text": text}).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": _BRAND})
+    with urllib.request.urlopen(req, timeout=8) as r:   # noqa: S310 — 운영자가 설정한 주소
+        r.read()
+
+
+_SENDERS = {"telegram": _send_telegram, "email": _send_email, "webhook": _send_webhook_text}
+
+
+def send_notification(text, subject=None, cfg=None, senders=None):
+    """설정된 모든 채널로 보낸다. 실패해도 예외를 밖으로 안 던지고 채널별 결과만 돌려준다."""
+    cfg = _NOTIFY if cfg is None else cfg
+    senders = senders or _SENDERS
+    subject = subject or text.splitlines()[0][:80]
+    results = {}
+    tg, em, wh = cfg.get("telegram") or {}, cfg.get("email") or {}, cfg.get("webhook")
+    jobs = []
+    if tg.get("bot_token") and tg.get("chat_id"):
+        jobs.append(("텔레그램", lambda: senders["telegram"](tg, text)))
+    if em.get("smtp_host") and em.get("to"):
+        jobs.append(("이메일", lambda: senders["email"](em, subject, text)))
+    if wh:
+        jobs.append(("웹훅", lambda: senders["webhook"](wh, text)))
+    for name, job in jobs:
+        try:
+            job()
+            results[name] = "ok"
+        except Exception as e:  # noqa: BLE001 — 알림 실패가 감시를 멈추게 두지 않는다
+            results[name] = "실패: " + _scrub(f"{type(e).__name__}: {e}", cfg)
+            print(f"⚠ {name} 알림 실패(무시하고 계속): {results[name]}")
+    return results
+
+
+def _where_text(ip, ipinfo):
+    i = (ipinfo or {}).get(ip) or {}
+    if _is_internal(ip):
+        return "사내"
+    if not i.get("ok"):
+        return ""
+    label = _IP_KINDS.get(i.get("kind") or "unknown", _IP_KINDS["unknown"])[1]
+    c = _COUNTRY_KO.get(i.get("country", ""), i.get("country", ""))
+    return " · ".join(x for x in (c, label) if x)
+
+
+def fmt_incident_msg(inc, ipinfo=None):
+    """사고 의심 즉시 알림 — 폰 화면 한 장에 '무엇·어디서·왜·할 일'."""
+    kind = {"exposure": "노출 의심", "attack_ok": "공격 성공 의심", "login": "수상한 로그인"}.get(inc["type"], inc["type"])
+    where = _where_text(inc["ip"], ipinfo)
+    lines = [f"[{_BRAND}] 🔴 확인 필요 — {kind}",
+             inc["title"],
+             f"시각: {str(inc['ts'])[:19].replace('T', ' ')}",
+             f"IP: {inc['ip']}" + (f" ({where})" if where else ""),
+             f"요청: {inc['method']} {inc['path']} → {inc['status']}"]
+    lines += [f"· {r}" for r in inc.get("reasons") or []]
+    lines.append(f"할 일: {inc['advice']}")
+    lines.append("상황판에서 확인 후 [확인함]을 눌러 주세요.")
+    return "\n".join(lines)
+
+
+def daily_report(conn, day, ipinfo=None, health=None):
+    """하루치 요약 자료(DB 기준)."""
+    s = today_summary(conn=conn, today=day)
+    top = conn.execute(
+        "SELECT ip, COUNT(*) c FROM intrusion WHERE COALESCE(deleted,0)=0 AND ts LIKE ?"
+        " GROUP BY ip ORDER BY c DESC LIMIT 3", (day + "%",)).fetchall()
+    kinds = conn.execute(
+        "SELECT kind, COUNT(*) c FROM intrusion WHERE COALESCE(deleted,0)=0 AND ts LIKE ?"
+        " GROUP BY kind ORDER BY c DESC", (day + "%",)).fetchall()
+    new_inc = conn.execute("SELECT COUNT(*) FROM incident WHERE ts LIKE ?", (day + "%",)).fetchone()[0]
+    open_inc = conn.execute("SELECT COUNT(*) FROM incident WHERE ack=0").fetchone()[0]
+    return {"date": day, "attempts": s["attempts"], "blocked": s["blocked"],
+            "top": [(ip, c, _where_text(ip, ipinfo)) for ip, c in top],
+            "kinds": [(k or "기타", c) for k, c in kinds], "new_incidents": new_inc,
+            "open_incidents": open_inc, "health": health or {}}
+
+
+def fmt_daily_msg(r):
+    """매일 아침 요약 — 대표님이 10초에 읽게. 마지막 줄은 '감시가 살아 있다'는 신호."""
+    d = r["date"][5:].replace("-", "/")
+    lamp = (f"🔴 확인 필요 {r['open_incidents']}건 — 상황판에서 확인해 주세요" if r["open_incidents"]
+            else "🟢 조치 필요 없음")
+    lines = [f"[{_BRAND}] {d} 보안 요약", lamp,
+             f"공격 시도 {r['attempts']}건 · 그중 차단·거절 {r['blocked']}건 · 새 사고 의심 {r['new_incidents']}건"]
+    if r["top"]:
+        lines.append("많이 온 IP: " + ", ".join(
+            f"{ip}{'(' + w + ')' if w else ''} {c}건" for ip, c, w in r["top"]))
+    if r["kinds"]:
+        lines.append("종류: " + ", ".join(f"{k} {c}" for k, c in r["kinds"][:5]))
+    h = r.get("health") or {}
+    if h.get("problems"):
+        lines.append("⚠ 감시 이상: " + "; ".join(h["problems"]))
+    else:
+        lines.append("감시 상태: 정상")
+    lines.append(f"— {_BRAND} 정상 작동 중 (이 요약이 오지 않으면 감시가 멈춘 것이니 서버를 확인하세요)")
+    return "\n".join(lines)
+
+
+def check_url(url, timeout=6):
+    """사이트가 살아 있나 — 5xx·연결 실패·시간 초과면 죽은 것. 401·404 처럼 답이라도 하면 산 것."""
+    req = urllib.request.Request(url, headers={"User-Agent": _HEALTH_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:   # noqa: S310 — 운영자가 설정한 내부 주소
+            return True, f"{r.status}"
+    except urllib.error.HTTPError as e:
+        return e.code < 500, (f"{e.code}" if e.code < 500 else f"서버 오류 {e.code}")
+    except Exception as e:  # noqa: BLE001 — 폰에서 읽을 말로(윈도 오류 문구 그대로 보내지 않음)
+        reason = getattr(e, "reason", e)
+        if isinstance(reason, ConnectionRefusedError):
+            return False, "연결 거부(꺼져 있음)"
+        if isinstance(reason, TimeoutError) or isinstance(e, TimeoutError):
+            return False, "응답 시간 초과"
+        return False, _clip(f"연결 실패: {type(reason).__name__}", 60)
+
+
+class HealthMonitor:
+    """연속 실패 N번이면 '응답 없음', 다시 되면 '복구' — 상태가 바뀔 때만 알림(같은 알림 반복 금지)."""
+
+    def __init__(self, urls, fail_after=2, checker=check_url):
+        self.urls, self.fail_after, self.checker = list(urls or []), max(1, int(fail_after)), checker
+        self.fails = {u: 0 for u in self.urls}
+        self.down = {u: False for u in self.urls}
+        self.detail = {u: "" for u in self.urls}
+
+    def run(self):
+        """한 번 점검 → 바뀐 것 목록 [(url, 'down'|'up', detail)]."""
+        changes = []
+        for u in self.urls:
+            ok, detail = self.checker(u)
+            self.detail[u] = detail
+            if ok:
+                self.fails[u] = 0
+                if self.down[u]:
+                    self.down[u] = False
+                    changes.append((u, "up", detail))
+            else:
+                self.fails[u] += 1
+                if not self.down[u] and self.fails[u] >= self.fail_after:
+                    self.down[u] = True
+                    changes.append((u, "down", detail))
+        return changes
+
+    def problems(self):
+        return [f"사이트 응답 없음: {u} ({self.detail[u]})" for u in self.urls if self.down[u]]
+
+
+def log_stall_problem(logfile, minutes, now_ts=None):
+    """로그가 너무 오래 안 늘었나 — Caddy 가 멈췄거나 로그 경로가 바뀐 신호."""
+    if not minutes or not logfile:
+        return ""
+    try:
+        age = ((now_ts or time.time()) - os.path.getmtime(logfile)) / 60
+    except OSError:
+        return f"로그 파일을 읽을 수 없음: {logfile}"
+    return f"로그가 {int(age)}분째 새 기록 없음(Caddy 멈춤 또는 매우 조용한 시간)" if age >= minutes else ""
+
+
+def daily_due(now, daily_at, last_sent):
+    """오늘 요약을 보낼 때인가 — 설정 시각이 지났고, 오늘 아직 안 보냈으면."""
+    if not daily_at:
+        return False
+    try:
+        hh, mm = (int(x) for x in str(daily_at).split(":"))
+    except ValueError:
+        return False
+    return (now.hour, now.minute) >= (hh, mm) and last_sent != now.strftime("%Y-%m-%d")
+
+
+def get_meta(conn, key, default=""):
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_meta(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (key, str(value)))
+    conn.commit()
+
+
 def build_dashboard_payload(results, dist, timeline=None):
     """탐지 결과(dict) → 화면이 읽을 JSON-안전 자료. '자료/보여주기 분리' 원칙 그대로.
 
@@ -2185,6 +2443,8 @@ _DASHBOARD_HTML = """<!doctype html>
   .lamp .ltitle { flex:1; min-width:200px; }
   .lamp .lbtns { display:flex; gap:6px; }
   .lbtn.ok { border-color:var(--green); color:var(--green); }
+  .lamp .ltag.warn { background:var(--bdg-w-bg); color:var(--bdg-w-fg); }
+  .lamp .lfoot { margin-top:8px; font-size:12px; color:var(--muted); display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   /* 여러 건 선택 삭제 */
   .chkcol { width:34px; text-align:center; padding-left:12px; }
   .rchk, #selall { width:15px; height:15px; cursor:pointer; accent-color:var(--accent); vertical-align:middle; }
@@ -2605,7 +2865,16 @@ function renderLamp(d){
   TODAY = d.today || null;
   var el = document.getElementById('lamp');
   if(!el){ return; }
+  var H = d.health || {}, probs = H.problems || [], ch = d.notify || [];
   var hist = '<button class="lbtn" onclick="openIncidentHistory()">사고 기록</button>';
+  var probRows = probs.map(function(p){
+    return '<div class="lrow"><span class="ltag warn">감시 이상</span><span class="ltitle">' + esc(p) + '</span></div>';
+  }).join('');
+  var foot = '<div class="lfoot">'
+    + (ch.length ? '🔔 알림: ' + esc(ch.join('·')) + ' <button class="lbtn" onclick="testNotify()">알림 시험</button>'
+                 : '🔕 알림 미설정 — 화면을 봐야만 알 수 있어요(설정 notify)')
+    + (H.watching ? ' · 🩺 사이트·로그 감시 중' + (H.at ? ' (' + esc(H.at) + ')' : '') : '')
+    + '</div>';
   if(INCIDENTS.length){
     el.className = 'lamp red';
     el.innerHTML = '<div class="lhead"><span class="ldot"></span><b>확인 필요 ' + INCIDENTS.length + '건</b>'
@@ -2617,14 +2886,24 @@ function renderLamp(d){
             + '<span class="ltitle">' + esc(x.title) + '</span>'
             + '<span class="lbtns"><button class="lbtn" onclick="openIncident(' + i + ')">자세히</button>'
             + '<button class="lbtn ok" onclick="ackIncident(' + i + ', true)">확인함</button></span></div>';
-        }).join('');
+        }).join('') + probRows + foot;
+  } else if(probs.length){
+    el.className = 'lamp orange';
+    el.innerHTML = '<div class="lhead"><span class="ldot"></span><b>감시 이상 ' + probs.length + '건</b>'
+      + '<span class="lsub">공격 사고는 아니지만, 사이트나 기록이 멈췄을 수 있어요. 서버를 확인해 주세요.</span>' + hist + '</div>'
+      + probRows + foot;
   } else {
     el.className = 'lamp green';
     var t = TODAY ? ('오늘 공격 시도 ' + TODAY.attempts + '건 — 사고 의심 0건'
                      + (TODAY.attempts ? ' (그중 차단·거절 ' + TODAY.blocked + '건)' : '')) : '사고 의심 0건';
     el.innerHTML = '<div class="lhead"><span class="ldot"></span><b>조치 필요 없음</b><span class="lsub">'
-      + esc(t) + '</span>' + hist + '</div>';
+      + esc(t) + '</span>' + hist + '</div>' + foot;
   }
+}
+function testNotify(){
+  postJSON('/api/notify/test', {}).then(function(res){
+    showUndo((res.ok ? '✅ 알림 시험 보냄 — ' : '⚠ ') + (res.message || ''), null);
+  });
 }
 function incidentBody(x){
   var rs = (x.reasons || []).map(function(r){ return '<li>' + esc(r) + '</li>'; }).join('');
@@ -3216,6 +3495,66 @@ def run_dashboard(a):
                 print(f"⚠ IP 출처 조회 실패(무시하고 계속): {e}")
             time.sleep(5)
 
+    def notifier():
+        """[알림·감시] 새 사고 즉시 알림 · 사이트/로그 감시 · 매일 요약.
+
+        채널이 없어도 감시 결과(감시 이상)는 화면 신호등에 보인다.
+        켠 시각 10분 전 이후의 사고만 알림 — 처음 켤 때 옛 로그의 사고가 한꺼번에 울리지 않게.
+        """
+        conn = open_db(a.db) if a.db else None
+        started = time.time()
+        mon = HealthMonitor(_HEALTH.get("urls") or [], _HEALTH.get("fail_after", 2))
+        interval = max(60, int(_HEALTH.get("interval", 300)))
+        stall_min = _HEALTH.get("log_stall_minutes", 0)
+        last_check, last_stall, last_daily_try = 0.0, "", 0.0
+
+        def _epoch(ts):
+            try:
+                return datetime.fromisoformat(str(ts)).timestamp()
+            except (ValueError, TypeError):
+                return time.time()
+
+        while True:
+            try:
+                now_ts = time.time()
+                channels = notify_channels()
+                with lock:
+                    fresh, state["fresh_incidents"] = state.get("fresh_incidents", []), []
+                    ipcache = dict(state["ipinfo"])
+                recent = [i for i in fresh if _epoch(i["ts"]) >= started - 600]
+                if channels and recent:
+                    for inc in recent[:5]:
+                        send_notification(fmt_incident_msg(inc, ipcache))
+                    if len(recent) > 5:
+                        send_notification(f"[{_BRAND}] 🔴 사고 의심 {len(recent) - 5}건 더 — 상황판에서 확인해 주세요")
+                if mon.urls and now_ts - last_check >= interval:
+                    last_check = now_ts
+                    for url, what, detail in mon.run():
+                        if channels:
+                            send_notification(f"[{_BRAND}] " + ("🟠 사이트 응답 없음" if what == "down" else "🟢 사이트 복구")
+                                              + f": {url} ({detail})")
+                stall = log_stall_problem(a.logfile, stall_min)
+                if stall != last_stall:
+                    if channels and (stall or last_stall):
+                        send_notification(f"[{_BRAND}] " + (f"🟠 {stall}" if stall else "🟢 로그 기록이 다시 들어옵니다"))
+                    last_stall = stall
+                health = {"problems": mon.problems() + ([stall] if stall else []),
+                          "watching": bool(mon.urls or stall_min), "at": datetime.now().strftime("%H:%M:%S")}
+                with lock:
+                    state["health"] = health
+                daily_at = _NOTIFY.get("daily_at", "08:30") if channels else ""
+                if conn is not None and daily_at and now_ts - last_daily_try >= 1800:
+                    now = datetime.now()
+                    if daily_due(now, daily_at, get_meta(conn, "last_daily")):
+                        last_daily_try = now_ts          # 전부 실패하면 30분 뒤 다시(재시도 폭주 방지)
+                        day = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+                        res = send_notification(fmt_daily_msg(daily_report(conn, day, ipcache, health)))
+                        if any(v == "ok" for v in res.values()):
+                            set_meta(conn, "last_daily", now.strftime("%Y-%m-%d"))
+            except Exception as e:  # noqa: BLE001 — 알림·감시가 실패해도 상황판은 멈추지 않는다
+                print(f"⚠ 알림·감시 실패(무시하고 계속): {e}")
+            time.sleep(15)
+
     # 켤 때마다 새로 만드는 비밀 표 — 진짜 화면에만 심어서, 조치 요청이 그 화면에서 왔는지 확인(CSRF 방지)
     token = secrets.token_urlsafe(24)
     page = (_DASHBOARD_HTML.replace("__LS_TOKEN__", token)
@@ -3246,6 +3585,8 @@ def run_dashboard(a):
                     resp["blocked"] = sorted(state["blocked"])    # 현재 차단 목록을 끼워 보냄
                     resp["trusted"] = sorted(state["trusted"])    # 신뢰(오탐) 목록도
                     resp["ip_lookup"] = _IP_LOOKUP                # 출처 조회 켜짐 여부
+                    resp["health"] = state.get("health", {})       # 사이트·로그 감시 상태
+                    resp["notify"] = notify_channels()             # 켜진 알림 채널 이름(값은 안 보냄)
                     resp["ipinfo"] = {ip: ipinfo_view(state["ipinfo"][ip])
                                       for ip in payload_ips(resp) if ip in state["ipinfo"]}
                 body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
@@ -3285,7 +3626,7 @@ def run_dashboard(a):
                                  "/api/trust", "/api/untrust",
                                  "/api/log/delete", "/api/log/restore", "/api/log/purge",
                                  "/api/log/delete_many", "/api/log/restore_many",
-                                 "/api/incident/ack"):
+                                 "/api/incident/ack", "/api/notify/test"):
                 self._send(404, b"not found", "text/plain; charset=utf-8")
                 return
             allowed, why = _post_allowed(self.headers, token)
@@ -3337,6 +3678,13 @@ def run_dashboard(a):
                 res = restore_logs(a.db, data)
             elif self.path == "/api/log/purge":
                 res = purge_logs(a.db, data)
+            elif self.path == "/api/notify/test":
+                if not notify_channels():
+                    res = {"ok": False, "message": "알림 채널이 설정되지 않았습니다(logsentry.json 의 notify)."}
+                else:
+                    r = send_notification(f"[{_BRAND}] 🔔 알림 시험 — 이 메시지가 보이면 알림 설정이 정상입니다.")
+                    res = {"ok": all(v == "ok" for v in r.values()),
+                           "message": " / ".join(f"{k}: {'성공' if v == 'ok' else v}" for k, v in r.items())}
             elif self.path == "/api/incident/ack":
                 key = str(data.get("key") or "")
                 if a.db:
@@ -3364,6 +3712,11 @@ def run_dashboard(a):
     threading.Thread(target=scanner, daemon=True).start()   # 재검사 스레드 시작
     if _IP_LOOKUP:
         threading.Thread(target=enricher, daemon=True).start()   # 출처 조회 스레드(설정으로 켤 때만)
+    threading.Thread(target=notifier, daemon=True).start()       # 알림·감시 스레드
+    if notify_channels():
+        print(f"🔔 알림 켜짐: {'·'.join(notify_channels())} (매일 요약 {_NOTIFY.get('daily_at', '08:30')})")
+    if _HEALTH.get("urls") or _HEALTH.get("log_stall_minutes"):
+        print(f"🩺 감시: 사이트 {len(_HEALTH.get('urls') or [])}곳, 로그 멈춤 {_HEALTH.get('log_stall_minutes', 0)}분")
     srv = ThreadingHTTPServer((a.host, a.dashboard), Handler)
     print(f"실시간 상황판 시작 — http://{a.host}:{a.dashboard}"
           f"  ({a.scan_interval}초마다 재검사, Ctrl+C 로 중지)")
@@ -3402,10 +3755,21 @@ def main():
                    help="상황판이 로그를 다시 읽는 주기(초, 기본 5)")
     p.add_argument("--db", default="logsentry.db",
                    help="침투 흔적을 영구 저장할 SQLite DB 파일(기본 logsentry.db). 빈 값이면 끔")
+    p.add_argument("--notify-test", action="store_true",
+                   help="설정 파일의 알림 채널로 시험 메시지를 보내고 결과만 보여준 뒤 끝낸다")
     p.add_argument("--show-db", type=int, nargs="?", const=30, metavar="N",
                    help="쌓인 침투 흔적 DB 에서 최근 N건(기본 30)을 표로 보여주고 끝낸다")
     a = p.parse_args()
 
+    if a.notify_test:             # 알림 설정 확인만 하고 끝
+        load_config(a.config)
+        if not notify_channels():
+            print("알림 채널이 설정되지 않았습니다 — logsentry.json 에 notify 를 넣으세요.")
+            sys.exit(1)
+        r = send_notification(f"[{_BRAND}] 🔔 알림 시험 — 이 메시지가 보이면 알림 설정이 정상입니다.")
+        for k, v in r.items():
+            print(f"  {k}: {'성공' if v == 'ok' else v}")
+        sys.exit(0 if all(v == "ok" for v in r.values()) else 1)
     if a.show_db is not None:     # DB 조회만 하고 끝(상황판 안 켜도 됨)
         print_db(a.db, a.show_db)
         return
