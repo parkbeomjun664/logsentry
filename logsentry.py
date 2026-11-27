@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -1746,7 +1747,9 @@ def detect_incidents(events, ipinfo=None, fail_threshold=5):
                 typ = "login"
         if typ:
             ts_iso = e["ts"].isoformat()
-            out.append({"key": f"{typ}|{ts_iso}|{ip}|{path}|{st}", "type": typ, "ts": ts_iso, "ip": ip,
+            key = f"{typ}|{ts_iso}|{ip}|{path}|{st}"
+            out.append({"key": key, "id": hashlib.sha1(key.encode("utf-8")).hexdigest()[:12],
+                        "type": typ, "ts": ts_iso, "ip": ip,
                         "path": _clip(path, 200), "method": e.get("method") or "GET", "status": st,
                         "title": _INCIDENT_TITLE[typ], "reasons": reasons, "advice": _INCIDENT_ADVICE[typ]})
     return out
@@ -1881,7 +1884,22 @@ def _send_telegram(tg, text):
         r.read()
 
 
-def _send_email(em, subject, text):
+def _email_html(text, link=None):
+    """메일 HTML 본문 — 글은 그대로(이스케이프), 아래에 'InfoGuard 열기' 버튼."""
+    has_button = bool(link) and str(link).startswith(("http://", "https://"))
+    body = "<br>".join(esc_html(line) for line in text.splitlines()
+                       if not (has_button and line.startswith("바로가기")))
+    button = ""
+    if has_button:
+        href = esc_html(str(link)).replace('"', "&quot;")
+        button = (f'<p style="margin:18px 0 6px"><a href="{href}" '
+                  'style="background:#1f6feb;color:#ffffff;padding:10px 18px;border-radius:8px;'
+                  f'text-decoration:none;font-weight:bold;display:inline-block">{esc_html(_BRAND)} 열기</a></p>')
+    return ('<div style="font-family:Segoe UI,Malgun Gothic,sans-serif;font-size:14px;line-height:1.6;color:#1f2328">'
+            + body + button + "</div>")
+
+
+def _send_email(em, subject, text, link=None):
     import smtplib
     import ssl
     from email.message import EmailMessage
@@ -1890,7 +1908,8 @@ def _send_email(em, subject, text):
     msg["From"] = em.get("from") or em.get("username")
     to = em.get("to")
     msg["To"] = ", ".join(to) if isinstance(to, (list, tuple)) else str(to)
-    msg.set_content(text)
+    msg.set_content(text)                                    # 글만 보이는 메일 앱용
+    msg.add_alternative(_email_html(text, link), subtype="html")   # 일반 메일 앱: 버튼
     port = int(em.get("smtp_port") or 587)
     ctx = ssl.create_default_context()
     if port == 465:
@@ -1924,7 +1943,7 @@ def _send_webhook_text(url, text):
 _SENDERS = {"telegram": _send_telegram, "email": _send_email, "webhook": _send_webhook_text}
 
 
-def send_notification(text, subject=None, cfg=None, senders=None):
+def send_notification(text, subject=None, cfg=None, senders=None, link=None):
     """설정된 모든 채널로 보낸다. 실패해도 예외를 밖으로 안 던지고 채널별 결과만 돌려준다."""
     cfg = _NOTIFY if cfg is None else cfg
     senders = senders or _SENDERS
@@ -1935,7 +1954,7 @@ def send_notification(text, subject=None, cfg=None, senders=None):
     if tg.get("bot_token") and tg.get("chat_id"):
         jobs.append(("텔레그램", lambda: senders["telegram"](tg, text)))
     if em.get("smtp_host") and em.get("to"):
-        jobs.append(("이메일", lambda: senders["email"](em, subject, text)))
+        jobs.append(("이메일", lambda: senders["email"](em, subject, text, link)))
     if wh:
         jobs.append(("웹훅", lambda: senders["webhook"](wh, text)))
     for name, job in jobs:
@@ -1959,7 +1978,21 @@ def _where_text(ip, ipinfo):
     return " · ".join(x for x in (c, label) if x)
 
 
-def fmt_incident_msg(inc, ipinfo=None):
+def dashboard_link(base, incident_key=None):
+    """메일 바로가기 주소 — 사고면 그 사고 상세가 바로 열리게(?inc=키)."""
+    if not base:
+        return ""
+    base = str(base).rstrip("/") + "/"
+    return base + ("?inc=" + urllib.parse.quote(incident_key, safe="") if incident_key else "")
+
+
+def _link_line(link, local_only):
+    if not link:
+        return ""
+    return ("바로가기(서버 PC 안에서만 열림): " if local_only else "바로가기: ") + link
+
+
+def fmt_incident_msg(inc, ipinfo=None, link="", local_only=False):
     """사고 의심 즉시 알림 — 폰 화면 한 장에 '무엇·어디서·왜·할 일'."""
     kind = {"exposure": "노출 의심", "attack_ok": "공격 성공 의심", "login": "수상한 로그인"}.get(inc["type"], inc["type"])
     where = _where_text(inc["ip"], ipinfo)
@@ -1971,6 +2004,8 @@ def fmt_incident_msg(inc, ipinfo=None):
     lines += [f"· {r}" for r in inc.get("reasons") or []]
     lines.append(f"할 일: {inc['advice']}")
     lines.append("상황판에서 확인 후 [확인함]을 눌러 주세요.")
+    if link:
+        lines.append(_link_line(link, local_only))
     return "\n".join(lines)
 
 
@@ -1991,7 +2026,7 @@ def daily_report(conn, day, ipinfo=None, health=None):
             "open_incidents": open_inc, "health": health or {}}
 
 
-def fmt_daily_msg(r):
+def fmt_daily_msg(r, link="", local_only=False):
     """매일 아침 요약 — 대표님이 10초에 읽게. 마지막 줄은 '감시가 살아 있다'는 신호."""
     d = r["date"][5:].replace("-", "/")
     lamp = (f"🔴 확인 필요 {r['open_incidents']}건 — 상황판에서 확인해 주세요" if r["open_incidents"]
@@ -2008,6 +2043,8 @@ def fmt_daily_msg(r):
         lines.append("⚠ 감시 이상: " + "; ".join(h["problems"]))
     else:
         lines.append("감시 상태: 정상")
+    if link:
+        lines.append(_link_line(link, local_only))
     lines.append(f"— {_BRAND} 정상 작동 중 (이 요약이 오지 않으면 감시가 멈춘 것이니 서버를 확인하세요)")
     return "\n".join(lines)
 
@@ -2907,11 +2944,31 @@ function renderLamp(d){
     el.innerHTML = '<div class="lhead"><span class="ldot"></span><b>조치 필요 없음</b><span class="lsub">'
       + esc(t) + '</span>' + hist + '</div>' + foot;
   }
+  openWantedIncident();
 }
 function testNotify(){
   postJSON('/api/notify/test', {}).then(function(res){
     showUndo((res.ok ? '✅ 알림 시험 보냄 — ' : '⚠ ') + (res.message || ''), null);
   });
+}
+// 메일 바로가기(?inc=사고키)로 들어오면 그 사고 상세를 바로 연다(처음 한 번만)
+var WANT_INC = (function(){ try { return new URLSearchParams(location.search).get('inc'); } catch(e){ return null; } })();
+function openWantedIncident(){
+  if(!WANT_INC){ return; }
+  var key = WANT_INC; WANT_INC = null;
+  try { history.replaceState(null, '', location.pathname); } catch(e){}   // 새로고침해도 다시 안 열리게
+  for(var i = 0; i < INCIDENTS.length; i++){
+    if(INCIDENTS[i].id === key || INCIDENTS[i].key === key){ openIncident(i); return; }
+  }
+  fetch('/api/incidents', {cache:'no-store'})                              // 이미 '확인함'이면 사고 기록에서
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      INCHIST = d.rows || [];
+      for(var j = 0; j < INCHIST.length; j++){
+        if(INCHIST[j].id === key || INCHIST[j].key === key){ histIncident(j); return; }
+      }
+      showUndo('메일에 적힌 사고 기록을 찾지 못했어요.', null);
+    });
 }
 function incidentBody(x){
   var rs = (x.reasons || []).map(function(r){ return '<li>' + esc(r) + '</li>'; }).join('');
@@ -3515,6 +3572,9 @@ def run_dashboard(a):
         interval = max(60, int(_HEALTH.get("interval", 300)))
         stall_min = _HEALTH.get("log_stall_minutes", 0)
         last_check, last_stall, last_daily_try = 0.0, "", 0.0
+        # 메일 바로가기 주소 — 폰 등 바깥에서 열 주소가 정해지면 notify.dashboard_url 로. 없으면 서버 PC 안 주소.
+        dash_base = _NOTIFY.get("dashboard_url") or f"http://127.0.0.1:{a.dashboard}/"
+        dash_local = not _NOTIFY.get("dashboard_url")
 
         def _epoch(ts):
             try:
@@ -3532,7 +3592,8 @@ def run_dashboard(a):
                 recent = [i for i in fresh if _epoch(i["ts"]) >= started - 600]
                 if channels and recent:
                     for inc in recent[:5]:
-                        send_notification(fmt_incident_msg(inc, ipcache))
+                        lk = dashboard_link(dash_base, inc.get("id") or inc["key"])
+                        send_notification(fmt_incident_msg(inc, ipcache, lk, dash_local), link=lk)
                     if len(recent) > 5:
                         send_notification(f"[{_BRAND}] 🔴 사고 의심 {len(recent) - 5}건 더 — 상황판에서 확인해 주세요")
                 if mon.urls and now_ts - last_check >= interval:
@@ -3556,7 +3617,9 @@ def run_dashboard(a):
                     if daily_due(now, daily_at, get_meta(conn, "last_daily")):
                         last_daily_try = now_ts          # 전부 실패하면 30분 뒤 다시(재시도 폭주 방지)
                         day = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-                        res = send_notification(fmt_daily_msg(daily_report(conn, day, ipcache, health)))
+                        lk = dashboard_link(dash_base)
+                        res = send_notification(fmt_daily_msg(daily_report(conn, day, ipcache, health), lk, dash_local),
+                                                link=lk)
                         if any(v == "ok" for v in res.values()):
                             set_meta(conn, "last_daily", now.strftime("%Y-%m-%d"))
             except Exception as e:  # noqa: BLE001 — 알림·감시가 실패해도 상황판은 멈추지 않는다

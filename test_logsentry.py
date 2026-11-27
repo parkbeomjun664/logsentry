@@ -1287,7 +1287,7 @@ class TestNotifyAndHealth(unittest.TestCase):
         def bad_tg(tg, text):
             raise RuntimeError("denied for token " + tg["bot_token"])
         senders = {"telegram": bad_tg,
-                   "email": lambda em, subj, text: sent.append(("mail", subj)),
+                   "email": lambda em, subj, text, link=None: sent.append(("mail", subj)),
                    "webhook": lambda url, text: sent.append(("hook", text))}
         cfg = {"telegram": self.TG, "email": {"smtp_host": "h", "to": ["a@b"], "password": "pw123"},
                "webhook": "https://hook"}
@@ -1316,6 +1316,47 @@ class TestNotifyAndHealth(unittest.TestCase):
         self.assertIn("메일 로그인 실패", r["이메일"])
         self.assertNotIn("connect()", r["이메일"])
         self.assertNotIn("abcdabcdabcdabcd", r["이메일"])
+
+    def test_dashboard_link_in_messages(self):
+        key = "login|2026-11-27T09:00:00+09:00|27.100.38.10|/api/auth/login|200"
+        lk = self.ls.dashboard_link("http://127.0.0.1:8790", key)
+        self.assertTrue(lk.startswith("http://127.0.0.1:8790/?inc="))
+        self.assertNotIn("|", lk)                                           # 키는 주소용으로 인코딩
+        self.assertEqual(self.ls.dashboard_link(""), "")
+        inc = {"type": "login", "title": "t", "ts": "2026-11-27T09:00:00", "ip": "27.100.38.10",
+               "method": "POST", "path": "/api/auth/login", "status": 200, "reasons": [], "advice": "a"}
+        self.assertIn("바로가기(서버 PC 안에서만 열림): " + lk, self.ls.fmt_incident_msg(inc, {}, lk, True))
+        self.assertIn("바로가기: https://guard.example/", self.ls.fmt_daily_msg(
+            {"date": "2026-11-26", "attempts": 1, "blocked": 1, "new_incidents": 0, "open_incidents": 0,
+             "top": [], "kinds": [], "health": {}}, "https://guard.example/", False))
+
+    def test_email_html_button_is_safe(self):
+        h = self.ls._email_html('공격 <script>x</script>' + chr(10) + '둘째 줄', 'https://g.example/?inc=a"b')
+        self.assertNotIn("<script>", h)                                     # 본문은 이스케이프
+        self.assertIn("&lt;script&gt;", h)
+        self.assertIn("<br>", h)
+        self.assertIn('href="https://g.example/?inc=a&quot;b"', h)          # 따옴표로 속성 못 깸
+        self.assertNotIn("<a ", self.ls._email_html("x", "javascript:alert(1)"))   # http(s) 만 버튼
+        got = []
+        self.ls.send_notification("[InfoGuard] t", cfg={"email": {"smtp_host": "h", "to": ["a@b"]}},
+                                  senders={"email": lambda em, subj, text, link=None: got.append(link)},
+                                  link="https://g.example/")
+        self.assertEqual(got, ["https://g.example/"])                       # 메일엔 버튼 주소가 전달됨
+
+    def test_short_incident_id_and_clean_html(self):
+        self.ls._AUTH_PATHS = ("/api/auth/login",)
+        ev = [e for e in (parse_line(l) for l in [
+            nginx("27.100.38.10", "10:00:01", "GET", "/.git/config", 200, "curl/8")]) if e]
+        inc = self.ls.detect_incidents(ev)[0]
+        self.assertRegex(inc["id"], r"^[0-9a-f]{12}$")                     # 짧은 번호
+        self.assertEqual(inc["id"], self.ls.detect_incidents(ev)[0]["id"])  # 같은 사고면 늘 같은 번호
+        lk = self.ls.dashboard_link("http://127.0.0.1:8790", inc["id"])
+        self.assertEqual(lk, "http://127.0.0.1:8790/?inc=" + inc["id"])
+        text = self.ls.fmt_incident_msg(inc, {}, lk, True)
+        self.assertIn("바로가기(서버 PC 안에서만 열림)", text)               # 글 메일엔 주소 그대로
+        html = self.ls._email_html(text, lk)
+        self.assertNotIn("바로가기(", html)                                 # 버튼 메일에선 긴 주소 줄 숨김
+        self.assertIn('href="' + lk + '"', html)
 
     def test_bad_telegram_token_rejected_before_network(self):
         with self.assertRaises(ValueError):
