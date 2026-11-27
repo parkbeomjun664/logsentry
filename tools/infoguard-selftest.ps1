@@ -32,11 +32,15 @@ foreach ($f in $LogSentry, $Config) { if (-not (Test-Path $f)) { Say "missing: $
 try { $l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Port); $l.Start(); $l.Stop() }
 catch { Say "port $Port is busy - pass -Port <other>"; exit 1 }
 
-# Confirm the config actually has an email channel, and show where mail will go (never the password)
-$chk = & $py -c "import sys; sys.path.insert(0, r'$lsDir'); import logsentry as L; L.load_config(r'$Config'); em=(L._NOTIFY or {}).get('email') or {}; to=em.get('to'); print('|'.join(['yes' if L.notify_channels() else 'no', ', '.join(to) if isinstance(to,(list,tuple)) else str(to or '')]))"
-$parts = ($chk -split '\|')
-if ($parts[0] -ne 'yes') { Say 'no notification channel in config (notify) - set it up first'; exit 1 }
-Say "email will be sent to: $($parts[1])"
+# Confirm the config has an email channel; read the mail-to AND the real login path from the config.
+# (load_config() prints a line to stdout, so tag our line with IGPROBE and read only that one.)
+$probeCode = "import sys; sys.path.insert(0, r'$lsDir'); import logsentry as L; L.load_config(r'$Config'); em=(L._NOTIFY or {}).get('email') or {}; to=em.get('to'); ap=(L._AUTH_PATHS or ['/api/auth/login'])[0]; print('IGPROBE|' + ('yes' if L.notify_channels() else 'no') + '|' + (', '.join(to) if isinstance(to,(list,tuple)) else str(to or '')) + '|' + ap)"
+$probeLine = (& $py -c $probeCode | Where-Object { $_ -like 'IGPROBE|*' } | Select-Object -Last 1)
+$parts = ($probeLine -split '\|')
+if ($parts[1] -ne 'yes') { Say 'no notification channel in config (notify) - set it up first'; exit 1 }
+$mailTo = $parts[2]; $authPath = $parts[3]
+Say "email will be sent to: $mailTo"
+Say "login path (from config auth_paths): $authPath"
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $work  = Join-Path $env:TEMP "infoguard-selftest-$stamp"
@@ -49,7 +53,8 @@ try {
     # --- synthetic attack log (all from 27.100.38.10, the IP that really attacked us) ---
     # 3 incidents: (a) secret file 200  (b) Next-Action request 200  (c) 6x login fail then success.
     # Plus a couple of blocked 404 probes to show those do NOT raise incidents.
-    $now = [int][double]::Parse((Get-Date -UFormat %s))
+    # true unix seconds (PS 5.1 'Get-Date -UFormat %s' treats local time as UTC -> 9h off in the email)
+    $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $ip  = '27.100.38.10'
     function L([int]$ago, [string]$m, [string]$uri, [int]$st, [bool]$na=$false) {
         $h = @{ 'User-Agent' = @('InfoGuard-selftest/1.0') }
@@ -63,13 +68,13 @@ try {
         (L 39 'GET'  '/.git/config'  404),
         (L 30 'GET'  '/.env'         200),          # (a) exposure
         (L 25 'POST' '/'             200 $true),    # (b) attack_ok (Next-Action)
-        (L 20 'POST' '/api/auth/login' 401),
-        (L 19 'POST' '/api/auth/login' 401),
-        (L 18 'POST' '/api/auth/login' 401),
-        (L 17 'POST' '/api/auth/login' 401),
-        (L 16 'POST' '/api/auth/login' 401),
-        (L 15 'POST' '/api/auth/login' 401),
-        (L 13 'POST' '/api/auth/login' 200)         # (c) login success after fails
+        (L 20 'POST' $authPath 401),
+        (L 19 'POST' $authPath 401),
+        (L 18 'POST' $authPath 401),
+        (L 17 'POST' $authPath 401),
+        (L 16 'POST' $authPath 401),
+        (L 15 'POST' $authPath 401),
+        (L 13 'POST' $authPath 200)                 # (c) login success after fails (real login path)
     )
     [IO.File]::WriteAllText($log, ($lines -join "`n") + "`n", (New-Object Text.UTF8Encoding($false)))
 
@@ -108,7 +113,7 @@ try {
     }
 
     if ($incs.Count -ge 3) {
-        Say ("SELFTEST PASS - 3 incident emails were sent to {0}. Check that inbox (and phone)." -f $parts[1])
+        Say ("SELFTEST PASS - 3 incident emails were sent to {0}. Check that inbox (and phone)." -f $mailTo)
         $code = 0
     } else {
         Say 'SELFTEST INCOMPLETE - fewer than 3 incidents (see output above)'
