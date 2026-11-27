@@ -1298,6 +1298,25 @@ class TestNotifyAndHealth(unittest.TestCase):
         self.assertNotIn(self.TG["bot_token"], r["텔레그램"])                # 비밀값은 오류 문구에도 안 나옴
         self.assertEqual(sent[0], ("mail", "[InfoGuard] 제목줄"))           # 첫 줄이 메일 제목
 
+    def test_email_login_failure_shows_real_cause(self):
+        """로그인 실패 뒤 연결 정리(quit)가 또 실패해도 '진짜 원인'이 보여야 한다(11/27 서버에서 가려졌던 버그)."""
+        import smtplib
+
+        class FakeSMTP:
+            def __init__(self, *a, **k): pass
+            def starttls(self, **k): pass
+            def login(self, u, p):
+                raise smtplib.SMTPAuthenticationError(535, b"5.7.8 Username and Password not accepted")
+            def send_message(self, m): raise AssertionError("로그인 실패면 보내면 안 됨")
+            def quit(self): raise smtplib.SMTPServerDisconnected("please run connect() first")
+        em = {"smtp_host": "smtp.gmail.com", "smtp_port": 587, "username": "a@gmail.com",
+              "password": "abcdabcdabcdabcd", "to": ["b@gmail.com"]}
+        with mock.patch("smtplib.SMTP", FakeSMTP):
+            r = self.ls.send_notification("[InfoGuard] 시험", cfg={"email": em})
+        self.assertIn("메일 로그인 실패", r["이메일"])
+        self.assertNotIn("connect()", r["이메일"])
+        self.assertNotIn("abcdabcdabcdabcd", r["이메일"])
+
     def test_bad_telegram_token_rejected_before_network(self):
         with self.assertRaises(ValueError):
             self.ls._send_telegram({"bot_token": "1/../../evil", "chat_id": "1"}, "x")

@@ -1900,10 +1900,18 @@ def _send_email(em, subject, text):
         server.starttls(context=ctx)              # 비밀번호가 평문으로 가지 않게 항상 암호화
     try:
         if em.get("username"):
-            server.login(em["username"], em.get("password") or "")
+            try:
+                server.login(em["username"], em.get("password") or "")
+            except (smtplib.SMTPAuthenticationError, smtplib.SMTPServerDisconnected):
+                # 가장 흔한 실패 — 사람이 읽을 말로(Gmail 원문 코드 대신)
+                raise RuntimeError("메일 로그인 실패 — 보내는 주소와 앱 비밀번호가 같은 계정 것인지, "
+                                   "그 계정에 2단계 인증이 켜져 있고 16자리가 맞는지 확인하세요") from None
         server.send_message(msg)
     finally:
-        server.quit()
+        try:
+            server.quit()
+        except (smtplib.SMTPException, OSError):
+            pass       # 이미 끊긴 연결 — 정리 중 오류가 위의 '진짜 원인'을 가리지 않게
 
 
 def _send_webhook_text(url, text):
